@@ -24,16 +24,24 @@ export default function Recorder({
   const recording = state === 'recording';
 
   return (
-    <div className="panel p-4">
+    <div
+      className={`panel p-4 ${
+        recording ? 'border-danger/50 shadow-[0_0_24px_rgb(var(--color-danger)/0.12)]' : ''
+      }`}
+    >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           {/* REC indicator */}
-          <span
-            aria-hidden="true"
-            className={`h-2.5 w-2.5 rounded-full ${
-              recording ? 'bg-danger' : 'bg-line-strong'
-            }`}
-          />
+          <span className="relative flex h-2.5 w-2.5 items-center justify-center" aria-hidden="true">
+            {recording ? (
+              <span className="animate-rec-pulse absolute inset-0 rounded-full bg-danger/50" />
+            ) : null}
+            <span
+              className={`relative h-2.5 w-2.5 rounded-full transition-colors duration-200 ${
+                recording ? 'bg-danger' : 'bg-line-strong'
+              }`}
+            />
+          </span>
           <div>
             <p className="text-sm font-medium text-content">
               {recording

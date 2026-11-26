@@ -1,40 +1,53 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import IntroCountdownOverlay from './IntroCountdownOverlay';
+import TargetExplosion from './TargetExplosion';
 import WordCarousel from './WordCarousel';
 import WordPop from './WordPop';
 import { DEFAULT_WORD, WORD_BANK, sequentialWords } from '../data/words';
 import { useLanguage } from '../i18n/LanguageContext';
-import { useBeatClock } from '../hooks/useBeatClock';
 import {
   TIMING,
   judgeOffset,
   offsetFromNearestBeat,
-  snapToBeats,
+  snapToBarBeats,
 } from '../lib/beatGrid';
 
 /**
- * How many upcoming words are held behind the active one.
- *
- * Enough to read as a queue and plan a line over it, few enough that the
- * whole column fits inside the target frame without being clipped.
+ * Total opening beats before the first word hits the target zone & explodes:
+ *  - Beats 0..11: 3 rounds of "1 - 2 - 3 - 4" (1/3, 2/3, 3/3)
+ *  - Beats 12..15: "3 - 2 - 1 - GO!"
+ *  - Beat 16: First word reaches the hit zone, explodes, and unmounts!
  */
-const QUEUE_LENGTH = 3;
+export const INTRO_BEATS = 16;
+
+const QUEUE_LENGTH = 4;
+
+/** Paired rhythm color alternation (lime, orange, orange, lime, lime...) */
+function toneForIndex(seq) {
+  return Math.floor((seq + 1) / 2) % 2 === 0 ? 'lime' : 'orange';
+}
+
+const IDLE_PREVIEW_WORD = {
+  id: 'idle-0',
+  text: DEFAULT_WORD,
+  tone: 'lime',
+  hitBeat: 0,
+};
 
 /**
- * The Bars Challenge word generator.
+ * Beat-Locked Word Engine (Hit Zone -> Explode -> Complete Unmount).
  *
- * Words appear on the beat. The reveal is driven by the beat clock rather
- * than a wall-clock timer, so the words stay locked to the music no matter
- * how long the session runs or how badly the browser stutters.
- *
- * A "hit" is registered when the performer presses the space bar or taps the
- * word while it is still on screen. How close that hit was to the beat
- * decides how it is judged — a hit on the beat explodes, a hit off the beat
- * only glows faintly.
- *
- * The component is controlled: the parent owns the clock so the timer can be
- * paused during the countdown and stopped cleanly at the end of a session.
+ * Uses a single `requestAnimationFrame` loop computing:
+ *   `currentBeat = (audioTime * bpm) / 60`
+ * (zero `setInterval`):
+ *  - Each word approaches over 2–4 beats before its `hitBeat` (16, 20, 24...).
+ *  - The instant `currentBeat >= word.hitBeat`, the word is removed from the
+ *    active highway and passed to `<TargetExplosion>` (Framer Motion
+ *    `AnimatePresence`) which bursts it (`scale: 1 -> 1.76`, opacity flash,
+ *    shockwave rings, 16 radial particles) over ~310ms and unmounts it
+ *    completely from the DOM — never holding it inside the hit zone!
  */
-export default function WordGenerator({
+const WordGenerator = memo(function WordGenerator({
   running,
   intervalMs,
   mode, // 'random' | 'sequential'
@@ -44,84 +57,54 @@ export default function WordGenerator({
   onWordShown,
   onWordHit,
   onWordMissed,
+  onStageBurst,
+  onIntroComplete,
 }) {
   const { locale, t } = useLanguage();
-  const [word, setWord] = useState(DEFAULT_WORD);
-  const [wordIndex, setWordIndex] = useState(0);
-  const [burnLeft, setBurnLeft] = useState(null);
-  const [pop, setPop] = useState(null); // { x, y, strength, key }
-  const [flash, setFlash] = useState(null); // 'perfect' | 'good' | 'miss'
-  // The words that are coming up, shown as a queue beneath the prompt.
   const [upcoming, setUpcoming] = useState([]);
+  const [introBeat, setIntroBeat] = useState(null); // 0..15 during intro, null after
+  const [bursts, setBursts] = useState([]); // [{ id, text, tone }] — auto-unmounted after ~320ms
+  const [pop, setPop] = useState(null);
+  const [flash, setFlash] = useState(null);
+  const [sweepKey, setSweepKey] = useState(0);
 
-  // The word currently on screen, and whether it has been hit.
-  const pendingRef = useRef(null); // { id, text, hit }
+  // Track the currently hittable word (approaching head or within brief post-impact grace).
+  const lastJudgedRef = useRef(null); // { id, text, hitBeat, hit }
   const indexRef = useRef(0);
-  // A counter that gives every drawn word a stable id, so the carousel can
-  // animate the same element as it moves between slots.
   const idRef = useRef(0);
-  // The card in the target frame, so a hit can be shown bursting from the
-  // word rather than from the corner of the screen.
+  const nextHitBeatRef = useRef(INTRO_BEATS);
+  const explodedIdsRef = useRef(new Set());
+  const introDoneRef = useRef(false);
+  const lastIntroBeatRef = useRef(-1);
+
   const frontCardRef = useRef(null);
-  // The materialised queue of words not yet shown.
+  const logoRef = useRef(null);
+  const targetBoxRef = useRef(null);
+  const beatDotRefs = useRef([]);
   const queueRef = useRef([]);
 
-  // How many beats between words. Rounded to a whole number of beats so the
-  // words always land on the grid.
-  const intervalBeats = bpm ? Math.max(1, snapToBeats(intervalMs / 1000, bpm)) : 0;
+  const beatClockRef = useRef({
+    currentBeat: 0,
+    beatIndex: 0,
+    beatPhase: 0,
+    beatInBar: 0,
+    audioTime: 0,
+  });
 
-  // The session's first beat, and how many beats have passed since. The
-  // clock's own beat index restarts on every loop, so the count is kept
-  // relative to this baseline instead.
-  const baseBeatRef = useRef(null);
-  const lastRevealRef = useRef(0);
-  const nextDueRef = useRef(0);
+  const effectiveBpm = bpm > 0 ? bpm : 120;
+  // Lock word intervals to whole 4/4 bars (4, 8, 12... beats) so every word
+  // explodes dead-on Beat 1 (the heavy kick downbeat) of the bar!
+  const intervalBeats = snapToBarBeats(intervalMs / 1000, effectiveBpm);
 
-  /** Reports the current word as missed, if it was not hit. */
-  const flushMiss = useCallback(() => {
-    const pending = pendingRef.current;
-    if (pending && !pending.hit) {
-      pendingRef.current = null;
-      onWordMissed?.(pending.text);
-      return true;
-    }
-    pendingRef.current = null;
-    return false;
-  }, [onWordMissed]);
+  const onWordShownRef = useRef(onWordShown);
+  onWordShownRef.current = onWordShown;
+  const onWordMissedRef = useRef(onWordMissed);
+  onWordMissedRef.current = onWordMissed;
+  const onStageBurstRef = useRef(onStageBurst);
+  onStageBurstRef.current = onStageBurst;
+  const onIntroCompleteRef = useRef(onIntroComplete);
+  onIntroCompleteRef.current = onIntroComplete;
 
-  // Reset when the session restarts or the language changes. The queue is
-  // refilled straight away, so the words are on screen before the first
-  // beat drops and the player can read ahead.
-  //
-  // This effect lives after `fillQueue` is defined, further down — a
-  // `useEffect` body runs after the whole component body, but the dependency
-  // array is read during the render, so the binding must already exist.
-  useEffect(() => {
-    indexRef.current = 0;
-    idRef.current = 0;
-    pendingRef.current = null;
-    queueRef.current = [];
-    setWord(DEFAULT_WORD);
-    setWordIndex(0);
-    setBurnLeft(null);
-    baseBeatRef.current = null;
-    lastRevealRef.current = 0;
-    nextDueRef.current = 0;
-  }, [running, mode, locale]);
-
-  /* ------------------------------------------------- the reveal interval */
-
-  /**
-   * Draws the next word from the bank.
-   *
-   * Sequential mode walks a de-duplicated bank in order; random mode picks
-   * from the whole bank. The same function fills the preview queue and
-   * reveals the active word, so what the queue shows is exactly what is
-   * coming — the queue can never promise a word that does not arrive.
-   *
-   * Each word carries a stable id, so the carousel can animate the *same*
-   * element as it moves up a slot rather than remounting it.
-   */
   const drawWord = useCallback(() => {
     let text;
     if (mode === 'sequential') {
@@ -132,10 +115,18 @@ export default function WordGenerator({
       const bank = WORD_BANK[locale] ?? WORD_BANK.en;
       text = bank[Math.floor(Math.random() * bank.length)];
     }
-    return { id: `${idRef.current++}`, text };
-  }, [mode, locale]);
+    const seq = idRef.current++;
+    const hitBeat = nextHitBeatRef.current;
+    nextHitBeatRef.current += intervalBeats;
+    return {
+      id: `w-${seq}`,
+      text,
+      tone: toneForIndex(seq),
+      hitBeat,
+      hit: false,
+    };
+  }, [mode, locale, intervalBeats]);
 
-  /** Keeps the preview queue topped up to QUEUE_LENGTH words. */
   const fillQueue = useCallback(() => {
     while (queueRef.current.length < QUEUE_LENGTH) {
       queueRef.current.push(drawWord());
@@ -143,137 +134,213 @@ export default function WordGenerator({
     setUpcoming([...queueRef.current]);
   }, [drawWord]);
 
-  // Refill the queue whenever it runs dry or the word source changes, so
-  // the words are on screen before the first beat drops.
+  // Reset & pre-populate queue when run starts or word settings change.
   useEffect(() => {
-    fillQueue();
-  }, [fillQueue]);
-
-  /**
-   * Reveals the next word. Called when the beat clock crosses a boundary
-   * that is a multiple of the interval, so the word always appears on the
-   * beat rather than whenever a timer happens to fire.
-   */
-  const reveal = useCallback(() => {
-    // The word we are replacing counts as a miss if it was never hit.
-    flushMiss();
-
-    // The active word is the head of the queue, so the queue and the
-    // prompt can never disagree about what is coming next.
-    const next = queueRef.current.shift() ?? drawWord();
-    setUpcoming([...queueRef.current]);
-    fillQueue();
-
-    pendingRef.current = { id: next.id, text: next.text, hit: false };
-    setWord(next.text);
-    setWordIndex((i) => i + 1);
-    // A fresh word starts with no verdict — the previous word's flash must not
-    // carry over into it, and its explosion must not linger over the new word.
+    indexRef.current = 0;
+    idRef.current = 0;
+    nextHitBeatRef.current = INTRO_BEATS;
+    explodedIdsRef.current.clear();
+    introDoneRef.current = false;
+    lastIntroBeatRef.current = -1;
+    lastJudgedRef.current = null;
+    queueRef.current = [];
     setFlash(null);
     setPop(null);
-    onWordShown?.(next.text);
-  }, [drawWord, fillQueue, onWordShown, flushMiss]);
+    setBursts([]);
+    beatClockRef.current = {
+      currentBeat: 0,
+      beatIndex: 0,
+      beatPhase: 0,
+      beatInBar: 0,
+      audioTime: 0,
+    };
 
-  /**
-   * Called on every beat boundary by the beat clock.
-   *
-   * The first word appears immediately when the session starts, then every
-   * `intervalBeats` beats after that.
-   *
-   * The beat index from the clock is *relative to the loop*, so it restarts
-   * at zero every time the beat loops. Counting from a baseline taken when
-   * the session starts — rather than from the clock's own index — keeps the
-   * count running across loop boundaries. Otherwise the challenge would stop
-   * revealing words after the first loop.
-   */
-  const handleBeat = useCallback(
-    (beatIndex) => {
-      if (!running) return;
+    if (running) {
+      setIntroBeat(0);
+    } else {
+      setIntroBeat(null);
+    }
+    fillQueue();
+  }, [running, mode, locale, fillQueue]);
 
-      if (baseBeatRef.current === null) {
-        // The session's first beat is the baseline.
-        baseBeatRef.current = beatIndex;
-        lastRevealRef.current = 0;
-        nextDueRef.current = intervalBeats;
-        reveal();
-        return;
+  // Remove burst entry from state once its ~310ms explosion finishes so
+  // `<AnimatePresence>` unmounts it cleanly from the DOM.
+  const handleBurstDone = useCallback((burstId) => {
+    setBursts((prev) => prev.filter((item) => item.id !== burstId));
+  }, []);
+
+  // Explode the arriving word STRICTLY ONCE when `currentBeat >= word.hitBeat`,
+  // removing it from the highway immediately so it explodes & unmounts cleanly!
+  const triggerWordExplosion = useCallback(
+    (wordEntry) => {
+      if (!wordEntry || explodedIdsRef.current.has(wordEntry.id)) return;
+      explodedIdsRef.current.add(wordEntry.id);
+
+      // Flush previous word as missed if it was never hit during its window.
+      const prevJudged = lastJudgedRef.current;
+      if (prevJudged && !prevJudged.hit) {
+        onWordMissedRef.current?.(prevJudged.text);
       }
 
-      // How many beats have passed since the session started.
-      const elapsedBeats = beatIndex - baseBeatRef.current;
-
-      if (elapsedBeats >= nextDueRef.current) {
-        lastRevealRef.current = elapsedBeats;
-        nextDueRef.current = elapsedBeats + intervalBeats;
-        reveal();
+      // Remove exploded word from the queue immediately (NOT held in the box!).
+      if (queueRef.current[0]?.id === wordEntry.id) {
+        queueRef.current.shift();
+      } else {
+        queueRef.current = queueRef.current.filter((w) => w.id !== wordEntry.id);
       }
+      fillQueue();
+
+      // Keep a brief grace reference so hitting right on or just after hitBeat still counts.
+      lastJudgedRef.current = wordEntry;
+
+      // Spawn the one-shot Framer Motion explode-and-unmount burst right at the Hit Zone.
+      setBursts((prev) => [
+        ...prev.slice(-2),
+        { id: wordEntry.id, text: wordEntry.text, tone: wordEntry.tone },
+      ]);
+      setSweepKey((k) => k + 1);
+      setFlash(null);
+      setPop(null);
+
+      onStageBurstRef.current?.();
+      onWordShownRef.current?.(wordEntry.text);
     },
-    [running, intervalBeats, reveal],
+    [fillQueue],
   );
 
-  const beatClock = useBeatClock({
-    audio,
-    bpm,
-    isPlaying: running && Boolean(audio),
-    onBeat: handleBeat,
-  });
-
-  /**
-   * Fallback for when there is no beat clock — a plain timer, so the
-   * component still works if the audio element is unavailable.
-   */
+  // Master 60/120fps `requestAnimationFrame` Beat Engine (ZERO `setInterval`).
   useEffect(() => {
-    if (!running || !audio || !intervalMs) return undefined;
-    const id = setInterval(reveal, intervalMs);
-    return () => clearInterval(id);
-  }, [running, audio, intervalMs, reveal]);
-
-  /* ------------------------------------------------------ burn mode timer */
-
-  useEffect(() => {
-    if (!running || !burnMode) {
-      setBurnLeft(null);
+    if (!running || typeof window === 'undefined') {
+      if (logoRef.current) logoRef.current.style.transform = '';
+      if (targetBoxRef.current) targetBoxRef.current.style.transform = 'translateX(-50%)';
       return undefined;
     }
 
-    // The burn window is a little shorter than the interval, so a word always
-    // disappears before the next one arrives.
-    const burnMs = Math.max(1200, Math.min(intervalMs - 400, intervalMs * 0.75));
-    setBurnLeft(burnMs);
+    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    const startedWallMs = performance.now();
+    let raf = null;
 
-    const id = setTimeout(() => {
-      // The word vanished without a hit — this is a miss.
-      flushMiss();
-      setBurnLeft(null);
-    }, burnMs);
+    const tick = (now) => {
+      raf = requestAnimationFrame(tick);
 
-    return () => clearTimeout(id);
-  }, [running, burnMode, intervalMs, word, flushMiss]);
+      const audioTime =
+        audio && typeof audio.elapsedTime === 'number'
+          ? audio.elapsedTime
+          : audio && typeof audio.currentTime === 'number'
+            ? audio.currentTime
+            : Math.max(0, (now - startedWallMs) / 1000);
+
+      const currentBeat = (audioTime * effectiveBpm) / 60;
+      const beatIndex = Math.floor(currentBeat);
+      const beatPhase = currentBeat - beatIndex;
+      const beatInBar = ((beatIndex % 4) + 4) % 4;
+
+      beatClockRef.current.currentBeat = currentBeat;
+      beatClockRef.current.beatIndex = beatIndex;
+      beatClockRef.current.beatPhase = beatPhase;
+      beatClockRef.current.beatInBar = beatInBar;
+      beatClockRef.current.audioTime = audioTime;
+
+      // 1) 16-beat opening timeline:
+      //    Beats 0..11: 3x "1 - 2 - 3 - 4" (1/3, 2/3, 3/3)
+      //    Beats 12..15: "3 - 2 - 1 - GO!"
+      if (beatIndex < INTRO_BEATS) {
+        if (beatIndex !== lastIntroBeatRef.current) {
+          lastIntroBeatRef.current = beatIndex;
+          setIntroBeat(beatIndex);
+          if (beatIndex === 15) {
+            onStageBurstRef.current?.();
+          }
+        }
+      } else if (!introDoneRef.current) {
+        introDoneRef.current = true;
+        setIntroBeat(null);
+        onIntroCompleteRef.current?.();
+      }
+
+      // 2) Exact hitBeat impact check (Beat 16+):
+      //    As soon as `currentBeat >= head.hitBeat`, explode & unmount the word!
+      if (currentBeat >= INTRO_BEATS) {
+        const head = queueRef.current[0];
+        if (head && currentBeat >= head.hitBeat && !explodedIdsRef.current.has(head.id)) {
+          triggerWordExplosion(head);
+        }
+      }
+
+      // 3) Direct GPU beat-bounce on Logo, 4-Corner Hit Zone, and 4 Beat Dots.
+      if (!reduced) {
+        const kick = Math.pow(Math.max(0, 1 - beatPhase), 2.5);
+        const downbeatBoost = beatInBar === 0 ? 1.28 : 1.0;
+
+        if (logoRef.current) {
+          const s = 1 + kick * 0.075 * downbeatBoost;
+          const ly = -kick * 3 * downbeatBoost;
+          logoRef.current.style.transform = `translate3d(0, ${ly.toFixed(2)}px, 0) scale(${s.toFixed(4)})`;
+        }
+
+        if (targetBoxRef.current) {
+          const bs = 1 + kick * 0.026 * downbeatBoost;
+          targetBoxRef.current.style.transform = `translateX(-50%) scale(${bs.toFixed(4)})`;
+          targetBoxRef.current.style.boxShadow = `0 0 ${(14 + kick * 34 * downbeatBoost).toFixed(1)}px rgba(247, 133, 1, ${(0.06 + kick * 0.24 * downbeatBoost).toFixed(3)})`;
+        }
+
+        for (let i = 0; i < 4; i += 1) {
+          const dot = beatDotRefs.current[i];
+          if (!dot) continue;
+          const activeDot = i === beatInBar;
+          const dotScale = activeDot ? 1 + kick * 0.55 : 0.82;
+          dot.style.transform = `scale(${dotScale.toFixed(3)})`;
+          dot.style.opacity = activeDot ? '1' : '0.26';
+          dot.style.background =
+            activeDot && i === 0
+              ? '#b8f147'
+              : activeDot
+                ? '#ff8814'
+                : 'rgba(255, 255, 255, 0.35)';
+          dot.style.boxShadow = activeDot
+            ? i === 0
+              ? '0 0 12px rgba(184, 241, 71, 0.85)'
+              : '0 0 12px rgba(247, 133, 1, 0.85)'
+            : 'none';
+        }
+      }
+    };
+
+    raf = requestAnimationFrame(tick);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [running, audio, effectiveBpm, triggerWordExplosion]);
 
   /* ------------------------------------------------------------ the hit */
 
   const registerHit = useCallback(() => {
-    const pending = pendingRef.current;
-    if (!pending || pending.hit) return;
-    pending.hit = true;
+    const currentBeat = beatClockRef.current.currentBeat;
+    // Allow hitting either the word that JUST exploded (within 0.6 beat grace)
+    // or the head word currently climbing into the hit zone.
+    const recent = lastJudgedRef.current;
+    let target = null;
+    if (recent && !recent.hit && currentBeat - recent.hitBeat <= 0.65) {
+      target = recent;
+    } else if (queueRef.current[0] && !queueRef.current[0].hit) {
+      target = queueRef.current[0];
+    }
 
-    // Work out how close to the beat this landed. The audio clock is the
-    // reference, sampled at the moment of the hit — accurate to within a
-    // frame, which is well inside the judgement window.
+    if (!target || target.hit) return;
+    target.hit = true;
+
     let judgement = TIMING.MISS;
     let offsetMs = 0;
 
-    if (bpm) {
-      const live = beatClock.live.current;
-      offsetMs = offsetFromNearestBeat(live.time, bpm);
+    if (effectiveBpm) {
+      offsetMs = offsetFromNearestBeat(beatClockRef.current.audioTime, effectiveBpm);
       judgement = judgeOffset(offsetMs);
     }
 
-    // Where the word is on screen, for the pop to originate from. The active
-    // word is the front card of the carousel, so that is what is measured.
     let origin = { x: 0, y: 0 };
-    if (frontCardRef.current) {
-      const rect = frontCardRef.current.getBoundingClientRect();
+    const anchorEl = targetBoxRef.current || frontCardRef.current;
+    if (anchorEl) {
+      const rect = anchorEl.getBoundingClientRect();
       origin = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     }
 
@@ -281,27 +348,25 @@ export default function WordGenerator({
       setPop({
         ...origin,
         strength: judgement,
-        // A changing key restarts the animation when two hits land together.
-        key: `${Date.now()}-${pending.text}`,
+        key: `${Date.now()}-${target.text}`,
       });
       setFlash(judgement);
+      onStageBurstRef.current?.();
     } else {
       setFlash('miss');
     }
 
-    onWordHit?.(pending.text, {
+    onWordHit?.(target.text, {
       onBeat: judgement === TIMING.PERFECT,
       offsetMs,
       judgement,
     });
-  }, [bpm, beatClock, onWordHit]);
+  }, [effectiveBpm, onWordHit]);
 
-  // SPACE hits the current word.
   useEffect(() => {
     if (!running) return undefined;
     const onKeyDown = (event) => {
       if (event.code !== 'Space' && event.key !== ' ') return;
-      // Let buttons and inputs handle their own space presses.
       const tag = event.target?.tagName;
       if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') {
         return;
@@ -313,70 +378,79 @@ export default function WordGenerator({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [running, registerHit]);
 
-  const burnProgress =
-    burnLeft !== null && burnMode
-      ? Math.max(0, Math.min(1, burnLeft / Math.max(1, intervalMs * 0.75)))
-      : null;
-
-  /**
-   * The deck the carousel renders: the active word at the head, then the
-   * words queued behind it.
-   *
-   * The active word is kept in the deck with the id it was drawn with, so
-   * the carousel can animate it as it moves up rather than remounting it.
-   */
-  const activeRef = useRef({ id: 'active-0', text: DEFAULT_WORD });
-  if (pendingRef.current) activeRef.current = pendingRef.current;
-  else if (activeRef.current.text !== word) {
-    activeRef.current = { id: `active-${wordIndex}`, text: word };
-  }
-
-  const deck = useMemo(
-    () => [{ id: activeRef.current.id, text: activeRef.current.text }, ...upcoming],
-    // The deck changes when the active word or the queue changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [word, wordIndex, upcoming],
-  );
-
   return (
-    <div className="stage-panel">
-      {/* The target frame, with the deck of cards inside it. The frame clips
-          its overflow, so a card leaving the top is cut off cleanly instead
-          of spilling over the rest of the page. */}
-      <div className="stage-well">
-        <div className="stage-brackets" aria-hidden="true">
-          <span className="stage-bracket stage-bracket-tl" />
-          <span className="stage-bracket stage-bracket-tr" />
-          <span className="stage-bracket stage-bracket-bl" />
-          <span className="stage-bracket stage-bracket-br" />
+    <div className="relative z-10 w-full">
+      {/* Centered brand logo + 4-beat visual pulse bar */}
+      <div className="flex flex-col items-center pb-1 pt-2">
+        <img
+          ref={logoRef}
+          src="/logo-mark.png"
+          alt=""
+          width={110}
+          height={40}
+          className="h-7 w-auto opacity-95 will-change-transform drop-shadow-[0_4px_14px_rgb(247_133_1/0.35)] sm:h-8"
+        />
+
+        <div aria-hidden="true" className="mt-1.5 flex items-center gap-2">
+          {[0, 1, 2, 3].map((i) => (
+            <span
+              key={i}
+              ref={(node) => {
+                beatDotRefs.current[i] = node;
+              }}
+              className="h-1.5 w-1.5 rounded-full bg-white/30 will-change-transform"
+              style={{ opacity: 0.28 }}
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* Vertical rhythm highway + 4-corner orange bracket hit zone */}
+      <div className="stage-highway">
+        <div
+          ref={targetBoxRef}
+          onClick={running ? registerHit : undefined}
+          className={`stage-target-box ${bursts.length > 0 && running ? 'is-landing' : ''}`}
+          style={{ pointerEvents: running ? 'auto' : 'none', cursor: running ? 'pointer' : 'default' }}
+        >
+          <span
+            key={`sweep-${sweepKey}`}
+            className={`stage-target-sweep ${sweepKey > 0 && running ? 'is-sweeping' : ''}`}
+            aria-hidden="true"
+          />
+          <span className="stage-bracket stage-bracket-tl" aria-hidden="true" />
+          <span className="stage-bracket stage-bracket-tr" aria-hidden="true" />
+          <span className="stage-bracket stage-bracket-bl" aria-hidden="true" />
+          <span className="stage-bracket stage-bracket-br" aria-hidden="true" />
+
+          {/* 16-beat opening timeline (Beats 0..11: 3x 1-2-3-4; Beats 12..15: 3-2-1-GO!) */}
+          {running && introBeat !== null ? (
+            <IntroCountdownOverlay introBeat={introBeat} />
+          ) : null}
+
+          {/* Explode-and-unmount word burst right inside the hit zone */}
+          <TargetExplosion bursts={bursts} onDone={handleBurstDone} />
         </div>
 
         <WordCarousel
-          words={deck}
+          idleWord={!running ? IDLE_PREVIEW_WORD : null}
+          upcoming={upcoming}
           running={running}
-          bpm={bpm}
+          intervalBeats={intervalBeats}
+          beatClockRef={beatClockRef}
           onHit={registerHit}
           hitFlash={flash}
           frontRef={frontCardRef}
         />
       </div>
 
-      {burnProgress !== null ? (
-        <div aria-hidden="true" className="mx-auto mt-4 w-40">
-          <div className="track h-[3px]">
-            <div className="track-fill" style={{ width: `${burnProgress * 100}%` }} />
-          </div>
-        </div>
-      ) : null}
-
-      <p className="mt-5 text-center text-xs leading-relaxed text-content-subtle">
+      <p className="mt-2 px-4 text-center text-[11px] leading-relaxed text-content-subtle">
         {running ? t('words.pressHint') : t('words.idleHint')}
       </p>
 
-      {/* The explosion, anchored to the word's position on screen. */}
-      {pop ? (
-        <WordPop origin={pop} strength={pop.strength} popKey={pop.key} />
-      ) : null}
+      {pop ? <WordPop origin={pop} strength={pop.strength} popKey={pop.key} /> : null}
     </div>
   );
-}
+});
+
+export default WordGenerator;

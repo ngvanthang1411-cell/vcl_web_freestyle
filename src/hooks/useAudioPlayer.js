@@ -1,255 +1,400 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 /**
- * A single shared <audio> element for the whole app.
+ * Web Audio API beat engine with AudioBuffer caching, gapless looping,
+ * sample-accurate DSP clock, and live AnalyserNode FFT spectrum.
  *
- * Keeping one element alive across screens is what makes beat previews switch
- * cleanly — swapping `src` on a fresh element each time would tear down the
- * decoder mid-playback and throw "The play() request was interrupted" errors.
+ * Playback lifecycle when pressing Play on a track:
+ *  1. Unlock AudioContext (`ctx.resume()` inside the click gesture).
+ *  2. Fetch & decode the track into an `AudioBuffer` (cached in memory so
+ *     re-playing or switching back is instantaneous).
+ *  3. Route `AudioBufferSourceNode -> GainNode -> AnalyserNode -> destination`
+ *     with `loop = true` for sample-accurate, gapless looping.
+ *  4. Expose a virtual clock object (`audio.currentTime`, `audio.duration`)
+ *     backed directly by `AudioContext.currentTime` so the beat grid, 60fps
+ *     BeatPulseBar, and equalizer ring stay razor-locked with zero jitter.
+ *  5. On pause, track switch, or unmount: immediately stop/disconnect the
+ *     active source node, invalidate any in-flight load token, and cancel
+ *     background timers to prevent leaks or clock drift.
  */
-let sharedAudio = null;
 
-function getSharedAudio() {
+let sharedCtx = null;
+let sharedGain = null;
+let sharedAnalyser = null;
+const bufferCache = new Map(); // src -> AudioBuffer
+
+function ensureAudioGraph() {
   if (typeof window === 'undefined') return null;
-  if (!sharedAudio) {
-    sharedAudio = new Audio();
-    sharedAudio.preload = 'metadata';
-    sharedAudio.crossOrigin = 'anonymous';
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+
+  if (!sharedCtx) {
+    sharedCtx = new Ctx();
+    sharedGain = sharedCtx.createGain();
+    sharedAnalyser = sharedCtx.createAnalyser();
+    sharedAnalyser.fftSize = 256;
+    sharedAnalyser.smoothingTimeConstant = 0.78;
+    sharedGain.connect(sharedAnalyser);
+    sharedAnalyser.connect(sharedCtx.destination);
   }
-  return sharedAudio;
+
+  return { ctx: sharedCtx, gain: sharedGain, analyser: sharedAnalyser };
 }
 
-/**
- * Controls the shared audio element: preview playback, looping for the actual
- * freestyle session, volume, and master mute.
- *
- * Also exposes a coarse "energy" value (0..1) derived from an AnalyserNode so
- * the UI can pulse in time with the beat.
- */
 export function useAudioPlayer() {
-  const audioRef = useRef(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(0.75);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [energy, setEnergy] = useState(0);
 
-  // Create the element during the first render, not in an effect, so that
-  // `player.audio` is a live reference from the very first render. The beat
-  // clock samples `audio.currentTime` and needs the element to already exist.
-  if (!audioRef.current && typeof window !== 'undefined') {
-    audioRef.current = getSharedAudio();
-  }
+  // Mutable live transport state (read imperatively at 60fps with 0 re-renders).
+  const stateRef = useRef({
+    src: null,
+    buffer: null,
+    source: null,
+    playing: false,
+    loop: true,
+    startedAtCtxTime: 0,
+    pausedOffset: 0,
+    duration: 0,
+    loadToken: 0,
+  });
 
   const analyserRef = useRef(null);
-  const rafRef = useRef(null);
-  const audioCtxRef = useRef(null);
-  const sourceRef = useRef(null);
-  const wiredRef = useRef(false);
+  const energyRef = useRef(0);
+  const timeSyncRef = useRef(null);
 
-  useEffect(() => {
-    const audio = getSharedAudio();
-    if (!audio) return undefined;
-    audioRef.current = audio;
-
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
-    const onEnded = () => setIsPlaying(false);
-    const onTime = () => setCurrentTime(audio.currentTime || 0);
-    const onLoaded = () => {
-      setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+  // Sample-accurate virtual audio clock facade compatible with useBeatClock,
+  // useBeatTimeline, StageCanvas, and WordGenerator (`audio.currentTime`).
+  // Compensates for Web Audio `baseLatency + outputLatency` so visual beats
+  // and word explosions align with what the player actually hears!
+  const clockFacadeRef = useRef(null);
+  if (!clockFacadeRef.current) {
+    const getAudibleElapsed = () => {
+      const s = stateRef.current;
+      if (!s.playing || !sharedCtx) return s.pausedOffset;
+      const baseLat =
+        typeof sharedCtx.baseLatency === 'number' && Number.isFinite(sharedCtx.baseLatency)
+          ? sharedCtx.baseLatency
+          : 0;
+      const outLat =
+        typeof sharedCtx.outputLatency === 'number' && Number.isFinite(sharedCtx.outputLatency)
+          ? sharedCtx.outputLatency
+          : 0;
+      const latencyComp = Math.min(0.25, Math.max(0, baseLat + outLat));
+      return Math.max(0, sharedCtx.currentTime - s.startedAtCtxTime - latencyComp);
     };
-    const onError = () => setIsPlaying(false);
 
-    audio.addEventListener('play', onPlay);
-    audio.addEventListener('pause', onPause);
-    audio.addEventListener('ended', onEnded);
-    audio.addEventListener('timeupdate', onTime);
-    audio.addEventListener('loadedmetadata', onLoaded);
-    audio.addEventListener('durationchange', onLoaded);
-    audio.addEventListener('error', onError);
-
-    return () => {
-      audio.removeEventListener('play', onPlay);
-      audio.removeEventListener('pause', onPause);
-      audio.removeEventListener('ended', onEnded);
-      audio.removeEventListener('timeupdate', onTime);
-      audio.removeEventListener('loadedmetadata', onLoaded);
-      audio.removeEventListener('durationchange', onLoaded);
-      audio.removeEventListener('error', onError);
+    clockFacadeRef.current = {
+      get currentTime() {
+        const s = stateRef.current;
+        const elapsed = getAudibleElapsed();
+        if (!s.playing) return s.pausedOffset;
+        if (s.loop && s.duration > 0) return elapsed % s.duration;
+        return s.duration > 0 ? Math.min(s.duration, elapsed) : elapsed;
+      },
+      get elapsedTime() {
+        return getAudibleElapsed();
+      },
+      get duration() {
+        return stateRef.current.duration;
+      },
+      get paused() {
+        return !stateRef.current.playing;
+      },
+      get loop() {
+        return stateRef.current.loop;
+      },
+      set loop(val) {
+        stateRef.current.loop = Boolean(val);
+        if (stateRef.current.source) {
+          stateRef.current.source.loop = Boolean(val);
+        }
+      },
     };
-  }, []);
+  }
 
-  // Push volume/mute changes onto the element.
+  // Keep GainNode synced with volume / mute.
   useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    audio.volume = volume;
-    audio.muted = isMuted;
+    if (sharedGain && sharedCtx) {
+      const target = isMuted ? 0 : volume;
+      sharedGain.gain.setTargetAtTime(target, sharedCtx.currentTime, 0.015);
+    }
   }, [volume, isMuted]);
 
-  /* ------------------------------------------------------- beat-reactive */
-
-  const stopMeter = useCallback(() => {
-    if (rafRef.current) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
+  const stopTimeSync = useCallback(() => {
+    if (timeSyncRef.current) {
+      clearInterval(timeSyncRef.current);
+      timeSyncRef.current = null;
     }
-    // The MediaElementSource is deliberately left connected: createMediaElementSource
-    // may only be called ONCE per element, so tearing it down would make the
-    // element permanently unusable for analysis on the next play.
-    setEnergy(0);
   }, []);
 
-  const startMeter = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    if (rafRef.current) return;
+  const startTimeSync = useCallback(() => {
+    stopTimeSync();
+    // Coarse 4Hz UI readout sync (only for seek slider & preview progress).
+    // Real-time 60fps animations read `audio.currentTime` directly without React!
+    timeSyncRef.current = setInterval(() => {
+      const s = stateRef.current;
+      if (!s.playing) return;
+      setCurrentTime(clockFacadeRef.current.currentTime);
+    }, 250);
+  }, [stopTimeSync]);
 
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-
-    try {
-      if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
-      const ctx = audioCtxRef.current;
-      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
-
-      if (!wiredRef.current) {
-        const source = ctx.createMediaElementSource(audio);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 128;
-        analyser.smoothingTimeConstant = 0.72;
-        source.connect(analyser);
-        // Route to the destination too — once an element is attached to a
-        // MediaElementSource it no longer outputs on its own.
-        source.connect(ctx.destination);
-        sourceRef.current = source;
-        analyserRef.current = analyser;
-        wiredRef.current = true;
+  const teardownSource = useCallback(() => {
+    const s = stateRef.current;
+    if (s.source) {
+      s.source.onended = null;
+      try {
+        s.source.stop();
+      } catch {
+        // Source may already be stopped.
       }
+      try {
+        s.source.disconnect();
+      } catch {
+        // Ignore already disconnected node.
+      }
+      s.source = null;
+    }
+  }, []);
 
-      const analyser = analyserRef.current;
-      if (!analyser) return;
+  const startBufferAt = useCallback(
+    (buffer, offsetSec) => {
+      const graph = ensureAudioGraph();
+      if (!graph || !buffer) return false;
+      const { ctx, gain, analyser } = graph;
+      analyserRef.current = analyser;
 
-      const data = new Uint8Array(analyser.frequencyBinCount);
+      teardownSource();
 
-      const tick = () => {
-        analyser.getByteFrequencyData(data);
-        let sum = 0;
-        for (let i = 0; i < data.length; i += 1) sum += data[i];
-        const avg = sum / data.length / 255;
-        setEnergy(Math.min(1, avg * 1.9));
-        rafRef.current = requestAnimationFrame(tick);
+      const s = stateRef.current;
+      const safeDur = buffer.duration || 0;
+      const safeOffset = safeDur > 0 ? Math.max(0, offsetSec % safeDur) : 0;
+
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.loop = s.loop;
+      if (s.loop && safeDur > 0) {
+        source.loopStart = 0;
+        source.loopEnd = safeDur;
+      }
+      source.connect(gain);
+
+      source.onended = () => {
+        if (s.source !== source) return;
+        if (!s.loop) {
+          s.playing = false;
+          s.pausedOffset = 0;
+          s.source = null;
+          stopTimeSync();
+          setIsPlaying(false);
+          setCurrentTime(0);
+        }
       };
-      rafRef.current = requestAnimationFrame(tick);
-    } catch {
-      // Analyser wiring can fail (e.g. cross-origin media). The app still works,
-      // the visuals just fall back to a static pulse.
-      analyserRef.current = null;
-    }
+
+      // Schedule slightly ahead (+35ms) for sample-accurate start right after
+      // AudioContext resume, preventing initial quantum jitter.
+      const scheduledStart = ctx.currentTime + 0.035;
+      gain.gain.setValueAtTime(isMuted ? 0 : volume, scheduledStart);
+      source.start(scheduledStart, safeOffset);
+
+      s.source = source;
+      s.buffer = buffer;
+      s.duration = safeDur;
+      s.playing = true;
+      s.startedAtCtxTime = scheduledStart - safeOffset;
+      s.pausedOffset = safeOffset;
+
+      setDuration(safeDur);
+      setCurrentTime(safeOffset);
+      setIsPlaying(true);
+      startTimeSync();
+      return true;
+    },
+    [isMuted, startTimeSync, stopTimeSync, teardownSource, volume],
+  );
+
+  const fetchAndDecode = useCallback(async (src) => {
+    if (bufferCache.has(src)) return bufferCache.get(src);
+    const graph = ensureAudioGraph();
+    if (!graph) return null;
+
+    const response = await fetch(src);
+    if (!response.ok) throw new Error(`Failed to fetch beat: ${response.status}`);
+    const arrayBuffer = await response.arrayBuffer();
+    const decoded = await graph.ctx.decodeAudioData(arrayBuffer);
+    bufferCache.set(src, decoded);
+    return decoded;
   }, []);
 
-  useEffect(() => {
-    return () => {
-      stopMeter();
-      if (audioCtxRef.current) {
-        audioCtxRef.current.close().catch(() => {});
-        audioCtxRef.current = null;
+  const pause = useCallback(() => {
+    const s = stateRef.current;
+    // Invalidate any pending async play/decode request.
+    s.loadToken += 1;
+    if (s.playing) {
+      s.pausedOffset = clockFacadeRef.current.currentTime;
+    }
+    teardownSource();
+    s.playing = false;
+    stopTimeSync();
+    energyRef.current = 0;
+    setIsPlaying(false);
+    setIsLoading(false);
+  }, [stopTimeSync, teardownSource]);
+
+  const load = useCallback(
+    (src) => {
+      if (!src) return;
+      pause();
+      const s = stateRef.current;
+      if (s.src !== src) {
+        s.src = src;
+        s.pausedOffset = 0;
+        setCurrentTime(0);
+        if (bufferCache.has(src)) {
+          const buf = bufferCache.get(src);
+          s.buffer = buf;
+          s.duration = buf.duration;
+          setDuration(buf.duration);
+        }
       }
-    };
-  }, [stopMeter]);
-
-  /* ------------------------------------------------------------ controls */
-
-  /** Loads a source without playing it. */
-  const load = useCallback((src) => {
-    const audio = audioRef.current;
-    if (!audio || !src) return;
-    audio.pause();
-    if (audio.getAttribute('src') !== src) {
-      audio.src = src;
-      audio.load();
-    }
-    setCurrentTime(0);
-  }, []);
+    },
+    [pause],
+  );
 
   /**
-   * Plays a source. If the same source is already playing it acts as a toggle
-   * (pause), which is how the beat cards behave.
+   * Unlocks AudioContext, loads & decodes the track (cached), and starts
+   * sample-accurate playback from offset 0 (on new track) or resume offset.
    */
   const play = useCallback(
-    async (src) => {
-      const audio = audioRef.current;
-      if (!audio || !src) return false;
+    async (src, { fromStart = false } = {}) => {
+      if (!src) return false;
+      const graph = ensureAudioGraph();
+      if (!graph) return false;
 
-      if (audio.getAttribute('src') !== src) {
-        audio.src = src;
-        audio.load();
-      }
+      const s = stateRef.current;
+      const token = ++s.loadToken;
+      const isNewTrack = s.src !== src;
 
+      // Step 1: Unlock / resume AudioContext inside user gesture.
       try {
-        await audio.play();
-        startMeter();
-        return true;
+        if (graph.ctx.state === 'suspended') {
+          await graph.ctx.resume();
+        }
       } catch {
-        // Autoplay was blocked — the user still needs to press play.
         setIsPlaying(false);
         return false;
       }
+
+      if (token !== s.loadToken) return false;
+
+      // Switching track or requesting fromStart resets cleanly to 0.
+      if (isNewTrack || fromStart) {
+        teardownSource();
+        s.playing = false;
+        s.src = src;
+        s.pausedOffset = 0;
+        setCurrentTime(0);
+      }
+
+      // Step 2: Load & decode AudioBuffer (or hit cache instantly).
+      let buffer = bufferCache.get(src) ?? null;
+      if (!buffer) {
+        setIsLoading(true);
+        try {
+          buffer = await fetchAndDecode(src);
+        } catch {
+          if (token === s.loadToken) {
+            setIsLoading(false);
+            setIsPlaying(false);
+          }
+          return false;
+        }
+        if (token !== s.loadToken) return false;
+        setIsLoading(false);
+      }
+
+      if (!buffer) return false;
+      return startBufferAt(buffer, isNewTrack || fromStart ? 0 : s.pausedOffset);
     },
-    [startMeter],
+    [fetchAndDecode, startBufferAt, teardownSource],
   );
 
-  const pause = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    audio.pause();
-    stopMeter();
-  }, [stopMeter]);
-
-  /** Pauses without tearing down the meter (used when navigating screens). */
-  const pauseOnly = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    audio.pause();
-  }, []);
-
   const toggleLoop = useCallback((shouldLoop) => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    audio.loop = shouldLoop;
-  }, []);
-
-  const seek = useCallback((seconds) => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    try {
-      audio.currentTime = seconds;
-      setCurrentTime(seconds);
-    } catch {
-      /* seeking before metadata loaded */
+    const val = Boolean(shouldLoop);
+    stateRef.current.loop = val;
+    if (stateRef.current.source) {
+      stateRef.current.source.loop = val;
+      if (val && stateRef.current.duration > 0) {
+        stateRef.current.source.loopStart = 0;
+        stateRef.current.source.loopEnd = stateRef.current.duration;
+      }
     }
   }, []);
 
-  const stopMeterRef = stopMeter;
+  const seek = useCallback(
+    (seconds) => {
+      const s = stateRef.current;
+      const safe = Math.max(0, Math.min(seconds || 0, s.duration || seconds || 0));
+      s.pausedOffset = safe;
+      setCurrentTime(safe);
+      if (s.playing && s.buffer) {
+        startBufferAt(s.buffer, safe);
+      }
+    },
+    [startBufferAt],
+  );
 
-  return {
-    audio: audioRef.current,
-    isPlaying,
-    isMuted,
-    volume,
-    currentTime,
-    duration,
-    energy,
-    load,
-    play,
-    pause,
-    pauseOnly,
-    toggleLoop,
-    seek,
-    setVolume,
-    setIsMuted,
-    stopMeter: stopMeterRef,
-  };
+  // Clean up source and timers on unmount (keep sharedCtx alive across HMR).
+  useEffect(() => {
+    return () => {
+      stopTimeSync();
+      teardownSource();
+      stateRef.current.playing = false;
+    };
+  }, [stopTimeSync, teardownSource]);
+
+  const stopMeter = useCallback(() => {
+    energyRef.current = 0;
+  }, []);
+
+  return useMemo(
+    () => ({
+      audio: clockFacadeRef.current,
+      analyserRef,
+      energyRef,
+      isPlaying,
+      isLoading,
+      isMuted,
+      volume,
+      currentTime,
+      duration,
+      energy: 0,
+      load,
+      play,
+      pause,
+      pauseOnly: pause,
+      toggleLoop,
+      seek,
+      setVolume,
+      setIsMuted,
+      stopMeter,
+    }),
+    [
+      isPlaying,
+      isLoading,
+      isMuted,
+      volume,
+      currentTime,
+      duration,
+      load,
+      play,
+      pause,
+      toggleLoop,
+      seek,
+      stopMeter,
+    ],
+  );
 }

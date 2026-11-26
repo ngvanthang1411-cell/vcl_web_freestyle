@@ -91,18 +91,44 @@ export default {
         },
         'word-hit': {
           '0%': { transform: 'scale(1)' },
-          '22%': { transform: 'scale(1.08)' },
+          '28%': { transform: 'scale(1.06)' },
           '100%': { transform: 'scale(1)' },
         },
         'pop-ring': {
-          '0%': { opacity: '0.8', transform: 'scale(0.3)' },
-          '100%': { opacity: '0', transform: 'scale(1.7)' },
+          '0%': { opacity: '0.9', transform: 'scale(0.25)' },
+          '100%': { opacity: '0', transform: 'scale(1.75)' },
+        },
+        'pop-ray': {
+          '0%': { opacity: '1', transform: 'translateY(0) scaleY(0.4)' },
+          '35%': { opacity: '0.95', transform: 'translateY(-14px) scaleY(1)' },
+          '100%': { opacity: '0', transform: 'translateY(-36px) scaleY(0.25)' },
+        },
+        'screen-enter': {
+          '0%': { opacity: '0', transform: 'translateY(12px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        'fade-up': {
+          '0%': { opacity: '0', transform: 'translateY(10px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        'rec-pulse': {
+          '0%, 100%': { opacity: '1', transform: 'scale(1)' },
+          '50%': { opacity: '0.45', transform: 'scale(1.4)' },
+        },
+        'eq-bar': {
+          '0%, 100%': { transform: 'scaleY(0.28)' },
+          '50%': { transform: 'scaleY(1)' },
         },
       },
       animation: {
         'word-rise': 'word-rise 260ms cubic-bezier(0.16, 1, 0.3, 1)',
         'word-hit': 'word-hit 320ms cubic-bezier(0.16, 1, 0.3, 1)',
-        'pop-ring': 'pop-ring 520ms cubic-bezier(0.16, 1, 0.3, 1) forwards',
+        'pop-ring': 'pop-ring 560ms cubic-bezier(0.16, 1, 0.3, 1) forwards',
+        'pop-ray': 'pop-ray 560ms cubic-bezier(0.16, 1, 0.3, 1) forwards',
+        'screen-enter': 'screen-enter 340ms cubic-bezier(0.16, 1, 0.3, 1) both',
+        'fade-up': 'fade-up 380ms cubic-bezier(0.16, 1, 0.3, 1) both',
+        'rec-pulse': 'rec-pulse 1.4s ease-in-out infinite',
+        'eq-bar': 'eq-bar 680ms ease-in-out infinite',
       },
     },
   },

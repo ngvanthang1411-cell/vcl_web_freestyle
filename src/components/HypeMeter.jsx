@@ -10,23 +10,22 @@ import { useT } from '../i18n/LanguageContext';
  */
 export default function HypeMeter({ score, durationMs = 1400 }) {
   const t = useT();
-  const [displayScore, setDisplayScore] = useState(0);
+  const [animatedValue, setAnimatedValue] = useState(0);
   const frameRef = useRef(null);
   const tier = getHypeTier(score);
   const tierLabel = t(`hype.tier.${tier.key}`);
   const tierBlurb = t(`hype.tier.${tier.key}.blurb`);
 
-  // Count the number up.
+  // Glide the arc and number smoothly from zero using easeOutExpo.
   useEffect(() => {
     const start = performance.now();
     const delta = score;
 
     const step = (now) => {
-      const t = Math.min(1, (now - start) / durationMs);
-      // easeOutExpo
-      const eased = t === 1 ? 1 : 1 - Math.pow(2, -10 * t);
-      setDisplayScore(Math.round(delta * eased));
-      if (t < 1) frameRef.current = requestAnimationFrame(step);
+      const progress = Math.min(1, (now - start) / durationMs);
+      const eased = progress === 1 ? 1 : 1 - Math.pow(2, -10 * progress);
+      setAnimatedValue(delta * eased);
+      if (progress < 1) frameRef.current = requestAnimationFrame(step);
     };
 
     frameRef.current = requestAnimationFrame(step);
@@ -34,6 +33,8 @@ export default function HypeMeter({ score, durationMs = 1400 }) {
       if (frameRef.current) cancelAnimationFrame(frameRef.current);
     };
   }, [score, durationMs]);
+
+  const displayScore = Math.round(animatedValue);
 
   // Arc geometry: a 240° sweep, opening downward.
   const R = 108;
@@ -58,7 +59,7 @@ export default function HypeMeter({ score, durationMs = 1400 }) {
     return `M ${start.x.toFixed(2)} ${start.y.toFixed(2)} A ${radius} ${radius} 0 ${largeArc} 1 ${end.x.toFixed(2)} ${end.y.toFixed(2)}`;
   };
 
-  const filledRatio = Math.max(0, Math.min(1, displayScore / 100));
+  const filledRatio = Math.max(0, Math.min(1, animatedValue / 100));
 
   return (
     <div className="flex flex-col items-center">
@@ -68,6 +69,14 @@ export default function HypeMeter({ score, durationMs = 1400 }) {
         role="img"
         aria-label={t('hype.aria', { score, tier: tierLabel })}
       >
+        <defs>
+          <linearGradient id="hype-arc-gradient" x1="0%" y1="100%" x2="100%" y2="0%">
+            <stop offset="0%" stopColor="rgb(var(--color-tertiary))" />
+            <stop offset="52%" stopColor="rgb(var(--color-accent))" />
+            <stop offset="100%" stopColor="rgb(var(--color-secondary))" />
+          </linearGradient>
+        </defs>
+
         {/* Track */}
         <path
           d={arcPath(START_ANGLE, START_ANGLE + SWEEP, R)}
@@ -78,13 +87,16 @@ export default function HypeMeter({ score, durationMs = 1400 }) {
         />
 
         {/* Filled portion */}
-        <path
-          d={arcPath(START_ANGLE, START_ANGLE + SWEEP * filledRatio, R)}
-          fill="none"
-          stroke="rgb(var(--color-accent))"
-          strokeWidth={STROKE}
-          strokeLinecap="round"
-        />
+        {filledRatio > 0.002 ? (
+          <path
+            d={arcPath(START_ANGLE, START_ANGLE + SWEEP * filledRatio, R)}
+            fill="none"
+            stroke="url(#hype-arc-gradient)"
+            strokeWidth={STROKE}
+            strokeLinecap="round"
+            style={{ filter: 'drop-shadow(0 0 10px rgb(var(--color-accent) / 0.45))' }}
+          />
+        ) : null}
 
         {/* Readout */}
         <text
@@ -96,6 +108,7 @@ export default function HypeMeter({ score, durationMs = 1400 }) {
             fontWeight: 600,
             fill: 'rgb(var(--color-content))',
             letterSpacing: '0.01em',
+            fontVariantNumeric: 'tabular-nums',
           }}
         >
           {displayScore}
@@ -115,8 +128,16 @@ export default function HypeMeter({ score, durationMs = 1400 }) {
         </text>
       </svg>
 
-      <p className="mt-2 text-xl font-semibold tracking-tight text-accent">{tierLabel}</p>
-      <p className="mt-1.5 max-w-xs text-center text-xs leading-relaxed text-content-muted">
+      <p
+        className="animate-fade-up mt-2 text-xl font-semibold tracking-tight text-accent"
+        style={{ animationDelay: '180ms' }}
+      >
+        {tierLabel}
+      </p>
+      <p
+        className="animate-fade-up mt-1.5 max-w-xs text-center text-xs leading-relaxed text-content-muted"
+        style={{ animationDelay: '260ms' }}
+      >
         {tierBlurb}
       </p>
     </div>

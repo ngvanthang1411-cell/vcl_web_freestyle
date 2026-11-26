@@ -23,6 +23,9 @@ export const BEATS = [
     src: '/beats/neon-nightrun.wav',
     bpm: 92,
     duration: 20.87,
+    vibe: 'Street',
+    colors: ['#F78501', '#753F01'],
+    bars: [0.78, 0.28, 0.45, 0.96, 0.24, 0.56, 0.34, 0.22, 0.48, 1.0, 0.32, 0.4],
     mood: {
       en: 'Driving, head-nod street anthem',
       vi: 'Hào hứng, giai điệu đường phố gật đầu theo nhịp',
@@ -34,6 +37,9 @@ export const BEATS = [
     src: '/beats/concrete-bounce.wav',
     bpm: 104,
     duration: 18.46,
+    vibe: 'Bounce',
+    colors: ['#FF4D9D', '#7A0C3E'],
+    bars: [0.92, 0.32, 0.64, 0.82, 0.2, 0.72, 0.44, 0.26, 0.88, 0.68, 0.3, 0.52],
     mood: {
       en: 'Hard boom-bap with a rolling pocket',
       vi: 'Boom-bap mạnh, nhịp lăn liền không ngắt',
@@ -45,6 +51,9 @@ export const BEATS = [
     src: '/beats/after-hours.wav',
     bpm: 78,
     duration: 24.62,
+    vibe: 'Chill',
+    colors: ['#BE70FA', '#481475'],
+    bars: [0.46, 0.22, 0.74, 0.54, 0.18, 0.62, 0.3, 0.24, 0.92, 0.48, 0.26, 0.36],
     mood: {
       en: 'Late-night, sparse and moody',
       vi: 'Khuya, thưa dãi và trầm tư',
@@ -56,6 +65,9 @@ export const BEATS = [
     src: '/beats/chrome-crest.wav',
     bpm: 126,
     duration: 15.24,
+    vibe: 'Uptempo',
+    colors: ['#34D399', '#0E5840'],
+    bars: [1.0, 0.36, 0.52, 0.88, 0.26, 0.42, 0.66, 0.22, 0.5, 0.98, 0.38, 0.46],
     mood: {
       en: 'Fast and relentless, for quick verses',
       vi: 'Nhanh và liên tục, hợp các verse ngắn',
@@ -67,6 +79,9 @@ export const BEATS = [
     src: '/beats/rooftop-radio.wav',
     bpm: 98,
     duration: 19.59,
+    vibe: 'Bounce',
+    colors: ['#FBBF24', '#7C4B05'],
+    bars: [0.84, 0.44, 0.72, 0.6, 0.22, 0.86, 0.42, 0.28, 0.76, 0.94, 0.36, 0.58],
     mood: {
       en: 'Open-air block party energy',
       vi: 'Năng lượng đại tiệc ngoài trời',
@@ -78,12 +93,17 @@ export const BEATS = [
     src: '/beats/midnight-lane.wav',
     bpm: 86,
     duration: 22.33,
+    vibe: 'Dark',
+    colors: ['#22D3EE', '#0D4E63'],
+    bars: [0.68, 0.24, 0.38, 0.98, 0.2, 0.46, 0.78, 0.18, 0.34, 0.9, 0.28, 0.42],
     mood: {
       en: 'Dark cruise, low and heavy',
       vi: 'Trầm, thấp và nặng nề',
     },
   },
 ];
+
+export const BEAT_VIBES = ['All', 'Street', 'Bounce', 'Chill', 'Uptempo', 'Dark'];
 
 export function getBeatById(id) {
   return BEATS.find((b) => b.id === id) ?? null;

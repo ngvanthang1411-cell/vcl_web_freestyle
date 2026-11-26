@@ -1,59 +1,52 @@
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import { useBeatTimeline } from '../hooks/useBeatTimeline';
 
 /**
- * The stage canvas.
+ * The stage canvas — 60fps imperative Canvas renderer with ZERO React re-renders.
  *
- * Two layers, both drawn imperatively so they never touch React:
+ *  - `variant="ring"`: The iconic golden-orange sunburst equalizer ring from
+ *    the video. Reads real live Web Audio FFT frequency bins (`analyserRef`)
+ *    blended with the beat pulse so every bar dances organically with the kick,
+ *    snare, and hi-hats!
  *
- *  1. The **ambient backdrop** — slow light streaks drifting behind the
- *     stage, and a soft aurora wash. It is deliberately almost still; it
- *     gives the black ground some depth without pulling focus.
- *
- *  2. The **equalizer ring** — a circle of ticks around the player's info,
- *     each tick breathing with the beat. The ring expands and brightens on
- *     the downbeat and settles before the next one, so it reads as locked to
- *     the music rather than to a timer.
- *
- * Everything is sampled from the audio clock by useBeatTimeline, so the ring
- * is at full strength exactly on the beat, and follows the tempo whenever the
- * loaded beat changes.
- *
- * The canvas is sized to the device pixel ratio, so the strokes stay crisp on
- * a retina display, and the render loop stops when the tab is hidden.
+ *  - `variant="stage"`: Deep matte obsidian backdrop (`#0A0A0C`) with subtle
+ *    warm diagonal perspective beams, soft ambient spotlight behind the target
+ *    frame, and crisp golden-orange spark particles that burst outward whenever
+ *    a word lands (`burstKey`).
  */
 
-/** How many ticks around the equalizer ring. */
-const TICK_COUNT = 72;
+const TICK_COUNT = 68;
 
-/** The ambient streaks, as [angle, speed, length, width, colour]. */
-const STREAKS = [
-  { angle: -0.35, speed: 0.045, length: 0.34, width: 1.1, alpha: 0.2, colour: '168, 85, 247' },
-  { angle: 0.42, speed: -0.031, length: 0.26, width: 0.9, alpha: 0.16, colour: '34, 211, 238' },
-  { angle: 1.9, speed: 0.026, length: 0.4, width: 1.3, alpha: 0.14, colour: '247, 133, 1' },
-  { angle: 2.85, speed: -0.038, length: 0.3, width: 1.0, alpha: 0.12, colour: '255, 77, 157' },
-  { angle: 4.1, speed: 0.022, length: 0.36, width: 1.2, alpha: 0.13, colour: '168, 85, 247' },
-  { angle: 5.35, speed: -0.019, length: 0.28, width: 0.8, alpha: 0.15, colour: '34, 211, 238' },
-];
-
-export default function StageCanvas({ audio, bpm, active, className = '' }) {
+const StageCanvas = memo(function StageCanvas({
+  audio,
+  analyserRef = null,
+  bpm,
+  active,
+  variant = 'stage',
+  burstKey = 0,
+  className = '',
+}) {
   const canvasRef = useRef(null);
-  // The live values the draw function reads. Writing to a ref avoids
-  // re-creating the effect on every render.
-  const phaseRef = useRef(0);
   const pulseRef = useRef(0);
   const timeRef = useRef(0);
   const runningRef = useRef(active);
   runningRef.current = active;
+  const analyserHolderRef = useRef(analyserRef);
+  analyserHolderRef.current = analyserRef;
+
+  // Imperative spark burst trigger when a word lands in the target box.
+  const pendingBurstRef = useRef(false);
+  const lastBurstKeyRef = useRef(burstKey);
+  if (burstKey !== lastBurstKeyRef.current) {
+    lastBurstKeyRef.current = burstKey;
+    if (burstKey > 0) pendingBurstRef.current = true;
+  }
 
   useBeatTimeline({
     audio,
     bpm,
     active,
-    onFrame: (phase, beatIndex, time) => {
-      phaseRef.current = phase;
-      // The pulse is the beat seen from the other end: full on the downbeat,
-      // fading to nothing by the next one.
+    onFrame: (phase, _beatIndex, time) => {
       pulseRef.current = 1 - phase;
       timeRef.current = time;
     },
@@ -68,6 +61,49 @@ export default function StageCanvas({ audio, bpm, active, className = '' }) {
     let width = 0;
     let height = 0;
     let raf = null;
+    let smoothPulse = 0;
+    let idleClock = 0;
+    let lastFrameMs = performance.now();
+
+    // Per-bar smoothed heights for buttery 60fps sunburst equalizer motion.
+    const barHeights = new Float32Array(TICK_COUNT);
+    let fftBins = null;
+
+    // Live spark particles for word-landing bursts (frames 00:04 & 00:07).
+    const sparks = [];
+
+    const spawnLandingSparks = () => {
+      if (!width || !height) return;
+      const cx = width * 0.5;
+      const cy = height * 0.44;
+      const boxHalfW = Math.min(width * 0.42, 220);
+      const boxHalfH = 54;
+      for (let i = 0; i < 22; i += 1) {
+        // Concentrate sparks around the 4 corners & edges of the target box.
+        const edge = i % 4;
+        const sx =
+          edge === 0 || edge === 2
+            ? cx + (Math.random() - 0.5) * boxHalfW * 2
+            : cx + (edge === 1 ? boxHalfW : -boxHalfW) + (Math.random() - 0.5) * 18;
+        const sy =
+          edge === 0 || edge === 2
+            ? cy + (edge === 0 ? -boxHalfH : boxHalfH) + (Math.random() - 0.5) * 14
+            : cy + (Math.random() - 0.5) * boxHalfH * 2;
+        const angle = Math.atan2(sy - cy, sx - cx) + (Math.random() - 0.5) * 0.6;
+        const speed = 35 + Math.random() * 95;
+        sparks.push({
+          x: sx,
+          y: sy,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed - 18,
+          size: 1.6 + Math.random() * 2.4,
+          life: 1,
+          decay: 1.25 + Math.random() * 0.9,
+          lime: Math.random() < 0.18,
+        });
+      }
+      if (sparks.length > 72) sparks.splice(0, sparks.length - 72);
+    };
 
     const resize = () => {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -80,126 +116,197 @@ export default function StageCanvas({ audio, bpm, active, className = '' }) {
     };
 
     resize();
-
     const observer = new ResizeObserver(resize);
     observer.observe(canvas);
 
-    const draw = () => {
-      raf = requestAnimationFrame(draw);
-
-      const phase = phaseRef.current;
-      const pulse = pulseRef.current;
-      const time = timeRef.current;
-
-      ctx.clearRect(0, 0, width, height);
-
-      /* ------------------------------------------------ the ambience */
-
-      // A slow aurora wash — two wide, barely-moving radial gradients.
-      const drift = time * 0.04;
-      const aurora = ctx.createRadialGradient(
-        width * (0.3 + Math.sin(drift) * 0.06),
-        height * (0.2 + Math.cos(drift * 0.8) * 0.05),
-        0,
-        width * 0.5,
-        height * 0.35,
-        Math.max(width, height) * 0.6,
-      );
-      aurora.addColorStop(0, 'rgba(120, 86, 247, 0.10)');
-      aurora.addColorStop(0.55, 'rgba(34, 180, 220, 0.045)');
-      aurora.addColorStop(1, 'rgba(0, 0, 0, 0)');
-      ctx.fillStyle = aurora;
-      ctx.fillRect(0, 0, width, height);
-
-      // The streaks: thin light lines drifting across the stage.
-      ctx.save();
-      ctx.globalCompositeOperation = 'lighter';
-      for (const s of STREAKS) {
-        const t = (time * s.speed + s.angle) % (Math.PI * 2);
-        const cx = width * 0.5;
-        const cy = height * 0.34;
-        const r = Math.min(width, height) * (0.32 + 0.1 * Math.sin(t * 2));
-        const x1 = cx + Math.cos(t) * r;
-        const y1 = cy + Math.sin(t) * r;
-        const len = Math.min(width, height) * s.length;
-        const x2 = x1 + Math.cos(t + 1.2) * len;
-        const y2 = y1 + Math.sin(t + 1.2) * len;
-
-        const grad = ctx.createLinearGradient(x1, y1, x2, y2);
-        grad.addColorStop(0, `rgba(${s.colour}, 0)`);
-        grad.addColorStop(0.5, `rgba(${s.colour}, ${s.alpha})`);
-        grad.addColorStop(1, `rgba(${s.colour}, 0)`);
-        ctx.strokeStyle = grad;
-        ctx.lineWidth = s.width;
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
-      }
-      ctx.restore();
-
-      /* --------------------------------------- the equalizer ring */
-
+    const drawRing = (pulse, time, dt) => {
       const cx = width * 0.5;
-      // The ring sits in the upper part of the canvas, so the info in the
-      // middle of it is not pushed off the top.
-      const cy = height * 0.42;
-      // The ring is sized from the smaller dimension, so it stays circular
-      // on a wide canvas and never overflows the top or bottom.
-      const baseRadius = Math.min(width, height) * 0.34;
+      const cy = height * 0.5;
+      const maxR = Math.min(width, height) * 0.49;
+      const innerR = maxR * 0.62;
 
-      // The ring swells on the beat.
-      const radius = baseRadius * (1 + pulse * 0.045);
-
-      ctx.save();
-      ctx.globalCompositeOperation = 'lighter';
-
-      for (let i = 0; i < TICK_COUNT; i += 1) {
-        // Each tick is a little behind the one before it, so the ring has a
-        // travelling wave rather than blinking as one block.
-        const offset = (i / TICK_COUNT) * Math.PI * 2;
-        const lag = 0.5 + 0.5 * Math.sin(offset * 3 - time * 2.2);
-        const reach = pulse * (0.35 + lag * 0.65);
-
-        const angle = offset - Math.PI / 2;
-        const inner = radius * (0.86 + reach * 0.06);
-        const outer = inner + baseRadius * (0.1 + reach * 0.16);
-
-        const x1 = cx + Math.cos(angle) * inner;
-        const y1 = cy + Math.sin(angle) * inner;
-        const x2 = cx + Math.cos(angle) * outer;
-        const y2 = cy + Math.sin(angle) * outer;
-
-        // The colour runs from violet through cyan to orange around the ring.
-        const hue = (i / TICK_COUNT) * 300 + 190;
-        const alpha = 0.34 + reach * 0.6;
-
-        ctx.strokeStyle = `hsla(${hue}, 88%, ${58 + reach * 14}%, ${alpha})`;
-        ctx.lineWidth = 1.5 + reach * 1.8;
-        ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
+      // Read live FFT frequency spectrum if available.
+      const analyser = analyserHolderRef.current?.current;
+      let hasFft = false;
+      if (analyser && runningRef.current) {
+        if (!fftBins || fftBins.length !== analyser.frequencyBinCount) {
+          fftBins = new Uint8Array(analyser.frequencyBinCount);
+        }
+        analyser.getByteFrequencyData(fftBins);
+        hasFft = true;
       }
 
-      // A soft disc of light behind the ring's centre.
-      const glow = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius * 1.05);
-      glow.addColorStop(0, `rgba(120, 90, 255, ${0.09 + pulse * 0.13})`);
-      glow.addColorStop(0.6, `rgba(20, 160, 220, ${0.03 + pulse * 0.05})`);
+      // Crisp inner orange hairline circle framing ON THE MIC / @HANDLE / BPM.
+      ctx.strokeStyle = `rgba(247, 133, 1, ${0.42 + pulse * 0.45})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(cx, cy, innerR - 3, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Subtle warm glow right behind the ring.
+      const glow = ctx.createRadialGradient(cx, cy, innerR * 0.5, cx, cy, maxR * 1.05);
+      glow.addColorStop(0, `rgba(247, 133, 1, ${0.06 + pulse * 0.1})`);
+      glow.addColorStop(0.7, `rgba(247, 133, 1, ${0.02 + pulse * 0.05})`);
       glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
       ctx.fillStyle = glow;
       ctx.beginPath();
-      ctx.arc(cx, cy, radius * 1.05, 0, Math.PI * 2);
+      ctx.arc(cx, cy, maxR * 1.05, 0, Math.PI * 2);
       ctx.fill();
+
+      const attack = 1 - Math.exp(-26 * dt);
+      const decay = 1 - Math.exp(-9 * dt);
+
+      ctx.save();
+      ctx.lineCap = 'round';
+
+      for (let i = 0; i < TICK_COUNT; i += 1) {
+        const norm = i / TICK_COUNT;
+        // Mirror left/right around top so the sunburst looks balanced & symmetrical
+        // with natural organic variation.
+        const sym = norm <= 0.5 ? norm * 2 : (1 - norm) * 2;
+        let fftVal = 0;
+        if (hasFft && fftBins) {
+          const binIdx = Math.min(
+            fftBins.length - 1,
+            Math.floor(Math.pow(sym, 1.35) * (fftBins.length * 0.65)),
+          );
+          fftVal = fftBins[binIdx] / 255;
+        }
+
+        const wave =
+          0.5 +
+          0.32 * Math.sin(norm * Math.PI * 6 - time * 3.6) +
+          0.18 * Math.cos(norm * Math.PI * 14 + time * 2.2);
+
+        const target = runningRef.current
+          ? Math.min(
+              1,
+              (hasFft ? fftVal * 0.52 + pulse * 0.62 : pulse * 0.92) * (0.52 + wave * 0.68),
+            )
+          : 0.16 + wave * 0.18;
+
+        const curr = barHeights[i];
+        barHeights[i] = curr + (target - curr) * (target > curr ? attack : decay);
+        const h = barHeights[i];
+
+        const angle = norm * Math.PI * 2 - Math.PI / 2;
+        // Ring itself expands outward slightly on each kick!
+        const kickRadius = innerR + pulse * 4.5;
+        const barLen = maxR * (0.08 + h * 0.3);
+        const x1 = cx + Math.cos(angle) * kickRadius;
+        const y1 = cy + Math.sin(angle) * kickRadius;
+        const x2 = cx + Math.cos(angle) * Math.min(maxR, kickRadius + barLen);
+        const y2 = cy + Math.sin(angle) * Math.min(maxR, kickRadius + barLen);
+
+        // Warm golden-amber sunburst bars (exact hue family from screencast).
+        const lightness = 46 + h * 26;
+        const alpha = 0.56 + h * 0.44;
+        ctx.strokeStyle = `hsla(${27 + h * 11}, 96%, ${lightness}%, ${alpha})`;
+        ctx.lineWidth = 2.1 + h * 0.9;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+      }
 
       ctx.restore();
     };
 
-    // Start the loop only when the tab is visible, and stop it when hidden,
-    // so a backgrounded tab does not burn a frame every millisecond.
+    const drawStage = (pulse, time, dt) => {
+      if (pendingBurstRef.current) {
+        pendingBurstRef.current = false;
+        spawnLandingSparks();
+      }
+
+      const cx = width * 0.5;
+      const targetCy = height * 0.45;
+
+      // Subtle warm radial spotlight centered behind the target frame.
+      const halo = ctx.createRadialGradient(
+        cx,
+        targetCy,
+        0,
+        cx,
+        targetCy,
+        Math.max(width, height) * 0.5,
+      );
+      halo.addColorStop(0, `rgba(247, 133, 1, ${0.045 + pulse * 0.06})`);
+      halo.addColorStop(0.5, `rgba(180, 90, 10, ${0.015 + pulse * 0.02})`);
+      halo.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.fillStyle = halo;
+      ctx.fillRect(0, 0, width, height);
+
+      // Subtle perspective highway rails converging up behind the conveyor.
+      ctx.save();
+      const topY = height * 0.36;
+      const botY = height * 0.92;
+      const rails = [-0.36, -0.18, 0.18, 0.36];
+      for (const r of rails) {
+        const xTop = cx + width * r * 0.52;
+        const xBot = cx + width * r * 1.1;
+        const grad = ctx.createLinearGradient(xTop, topY, xBot, botY);
+        grad.addColorStop(0, 'rgba(247, 133, 1, 0)');
+        grad.addColorStop(0.5, `rgba(247, 133, 1, ${0.045 + pulse * 0.045})`);
+        grad.addColorStop(1, 'rgba(247, 133, 1, 0)');
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xTop, topY);
+        ctx.lineTo(xBot, botY);
+        ctx.stroke();
+      }
+
+      // Update & draw crisp landing spark particles.
+      for (let i = sparks.length - 1; i >= 0; i -= 1) {
+        const s = sparks[i];
+        s.x += s.vx * dt;
+        s.y += s.vy * dt;
+        s.vx *= Math.pow(0.25, dt);
+        s.vy *= Math.pow(0.25, dt);
+        s.life -= s.decay * dt;
+        if (s.life <= 0) {
+          sparks.splice(i, 1);
+          continue;
+        }
+        ctx.fillStyle = s.lime
+          ? `rgba(176, 234, 66, ${(s.life * 0.9).toFixed(3)})`
+          : `rgba(254, 155, 42, ${(s.life * 0.95).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.size * (0.5 + s.life * 0.5), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    };
+
+    const draw = (now) => {
+      raf = requestAnimationFrame(draw);
+
+      const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameMs) / 1000));
+      lastFrameMs = now;
+      idleClock += dt;
+
+      const isLive = runningRef.current;
+      const targetPulse = isLive
+        ? Math.pow(Math.max(0, pulseRef.current), 2.2)
+        : 0.14 + 0.08 * Math.sin(idleClock * 2.0);
+      const rate = targetPulse > smoothPulse ? 34 : 11;
+      smoothPulse += (targetPulse - smoothPulse) * (1 - Math.exp(-rate * dt));
+
+      const time = isLive ? timeRef.current : idleClock * 0.55;
+
+      ctx.clearRect(0, 0, width, height);
+      if (variant === 'ring') {
+        drawRing(smoothPulse, time, dt);
+      } else {
+        drawStage(smoothPulse, time, dt);
+      }
+    };
+
     const start = () => {
-      if (raf === null) raf = requestAnimationFrame(draw);
+      if (raf === null) {
+        lastFrameMs = performance.now();
+        raf = requestAnimationFrame(draw);
+      }
     };
     const stop = () => {
       if (raf !== null) {
@@ -220,7 +327,9 @@ export default function StageCanvas({ audio, bpm, active, className = '' }) {
       observer.disconnect();
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, []);
+  }, [variant]);
 
   return <canvas ref={canvasRef} aria-hidden="true" className={className} />;
-}
+});
+
+export default StageCanvas;

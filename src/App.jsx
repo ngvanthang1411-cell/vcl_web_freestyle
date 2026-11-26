@@ -1,14 +1,19 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, MotionConfig, motion } from 'framer-motion';
 import AppShell from './components/AppShell';
 import YourBeatBar from './components/YourBeatBar';
 import LandingScreen from './screens/LandingScreen';
 import BeatSelectScreen from './screens/BeatSelectScreen';
+import SetupScreen from './screens/SetupScreen';
 import FreestyleScreen from './screens/FreestyleScreen';
 import ResultsScreen from './screens/ResultsScreen';
+import StatsScreen from './screens/StatsScreen';
 import { BEATS, beatText } from './data/beats';
 import { useAudioPlayer } from './hooks/useAudioPlayer';
 import { useMediaRecorder } from './hooks/useMediaRecorder';
 import { useLanguage, useT } from './i18n/LanguageContext';
+import { clearRuns, loadRuns, saveRun } from './lib/history';
+import { SPRING_BOUNCY, screenVariants } from './lib/motion';
 import { computeHypeScore, decodeSharePayload } from './lib/scoring';
 import { describeUnsupported } from './lib/permissions';
 
@@ -18,18 +23,27 @@ const DEFAULT_SETTINGS = {
   wordMode: 'random', // random | sequential
   burnMode: false,
   video: false,
+  practice: false,
+  battleMode: false,
+  handle: '',
+  opponent: '',
 };
 
 /**
  * The single-page state machine.
  *
- * Screens: landing → beatSelect → freestyle → results
+ * Wrapped in `<MotionConfig reducedMotion="user">` so every Framer Motion
+ * spring automatically respects `prefers-reduced-motion`.
  */
 export default function App() {
   const [screen, setScreen] = useState('landing');
   const [selectedBeat, setSelectedBeat] = useState(null);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [result, setResult] = useState(null);
+  const [runs, setRuns] = useState([]);
+  const [autoStartStage, setAutoStartStage] = useState(false);
+  const [toast, setToast] = useState(null);
+  const toastTimerRef = useRef(null);
 
   const player = useAudioPlayer();
   const recorder = useMediaRecorder({ video: settings.video });
@@ -39,10 +53,22 @@ export default function App() {
 
   const unsupported = useMemo(() => describeUnsupported(), []);
 
+  const showToast = useCallback((message) => {
+    if (!message) return;
+    setToast(message);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 2600);
+  }, []);
+
+  useEffect(() => {
+    setRuns(loadRuns());
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, []);
+
   /* -------------------------------------------- shared results from a link */
 
-  // A share link puts a #result=... payload in the URL. Decode it and jump
-  // straight to the results screen so the link shows something meaningful.
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const hash = window.location.hash;
@@ -59,6 +85,7 @@ export default function App() {
       wordsHit: payload.w ?? 0,
       perfectHits: payload.p ?? 0,
       wordsMissed: 0,
+      wordLog: [],
       completed: Boolean(payload.c),
       practiceMode: false,
       blob: null,
@@ -72,57 +99,74 @@ export default function App() {
 
   /* ----------------------------------------------------------- navigation */
 
-  const goToBeats = useCallback(() => {
-    player.pause();
-    setScreen('beatSelect');
-  }, [player]);
-
   const goToLanding = useCallback(() => {
     player.pause();
+    setAutoStartStage(false);
     setScreen('landing');
   }, [player]);
 
-  // Clicking a beat arms it in the bottom bar. The session starts from the
-  // bar's Play button, so the choice can still be changed before committing.
+  const goToSetup = useCallback(() => {
+    player.pause();
+    setScreen('setup');
+  }, [player]);
+
+  const goToStats = useCallback(() => {
+    player.pause();
+    setScreen('stats');
+  }, [player]);
+
   const handleSelectBeat = useCallback((beat) => {
     setSelectedBeat(beat);
   }, []);
 
-  // "Random beat" picks one from the crate without the user choosing.
   const handleRandomBeat = useCallback(() => {
-    const pick = BEATS[Math.floor(Math.random() * BEATS.length)];
-    setSelectedBeat(pick);
+    setSelectedBeat(null);
   }, []);
 
-  // Reshuffle while the random option is still armed.
-  const handleShuffleBeat = useCallback(() => {
-    setSelectedBeat((current) => {
-      const options = BEATS.filter((b) => b.id !== current?.id);
-      const pool = options.length ? options : BEATS;
-      return pool[Math.floor(Math.random() * pool.length)];
-    });
-  }, []);
+  const launchFreestyle = useCallback(
+    (auto = true) => {
+      player.pause();
+      let armed = selectedBeat;
+      if (!armed) {
+        armed = BEATS[Math.floor(Math.random() * BEATS.length)];
+        setSelectedBeat(armed);
+        showToast(t('toast.randomPicked', { title: armed.title }));
+      }
+      setAutoStartStage(auto);
+      setScreen('freestyle');
+    },
+    [player, selectedBeat, showToast, t],
+  );
 
-  const handleComplete = useCallback((raw) => {
-    const { score: _ignored, ...rest } = raw;
-    const { score } = computeHypeScore({
-      durationSeconds: rest.durationSeconds,
-      targetSeconds: rest.targetSeconds,
-      wordsShown: rest.wordsShown,
-      wordsHit: rest.wordsHit,
-      timingRatio:
-        rest.wordsHit > 0 ? (rest.perfectHits ?? 0) / rest.wordsHit : 0,
-      completed: rest.completed,
-      practiceMode: rest.practiceMode,
-    });
-    setResult({ ...rest, score });
-    setScreen('results');
-  }, []);
+  const handleComplete = useCallback(
+    (raw) => {
+      const { score: _ignored, ...rest } = raw;
+      const { score } = computeHypeScore({
+        durationSeconds: rest.durationSeconds,
+        targetSeconds: rest.targetSeconds,
+        wordsShown: rest.wordsShown,
+        wordsHit: rest.wordsHit,
+        timingRatio:
+          rest.wordsHit > 0 ? (rest.perfectHits ?? 0) / rest.wordsHit : 0,
+        completed: rest.completed,
+        practiceMode: rest.practiceMode,
+      });
+      const finalResult = { ...rest, score };
+      setResult(finalResult);
+      const updated = saveRun(finalResult);
+      setRuns(updated);
+      setAutoStartStage(false);
+      setScreen('results');
+      showToast(t('toast.savedRun'));
+    },
+    [showToast, t],
+  );
 
   const handleRestart = useCallback(() => {
     player.pause();
     recorder.reset();
     setResult(null);
+    setAutoStartStage(true);
     setScreen('freestyle');
   }, [player, recorder]);
 
@@ -130,105 +174,177 @@ export default function App() {
     player.pause();
     recorder.reset();
     setResult(null);
-    setScreen('beatSelect');
+    setAutoStartStage(false);
+    setScreen('landing');
   }, [player, recorder]);
 
-  // The side rail can jump between the stages of a run. The shell disables
-  // the entries that are not reachable yet, so this only has to move state.
+  const handleResetStats = useCallback(() => {
+    clearRuns();
+    setRuns([]);
+    showToast(t('stats.resetDone'));
+  }, [showToast, t]);
+
   const handleNavigate = useCallback(
     (target) => {
       if (target === 'landing') return goToLanding();
-      if (target === 'beatSelect') return goToBeats();
+      if (target === 'setup') return goToSetup();
+      if (target === 'stats') return goToStats();
+      if (target === 'beatSelect') return goToLanding();
       if (target === 'freestyle' && selectedBeat) return setScreen('freestyle');
       if (target === 'results' && result) return setScreen('results');
       return undefined;
     },
-    [goToBeats, goToLanding, result, selectedBeat],
+    [goToLanding, goToSetup, goToStats, result, selectedBeat],
   );
 
   /* -------------------------------------------------------------- render */
 
-  const playing = player.isPlaying;
-
-  // The beat armed for the next run. "Random" is the default state — it picks
-  // one from the crate on shuffle, and the user can still override it.
   const armedBeat = selectedBeat ?? null;
   const isRandom = !selectedBeat;
+  const modeSummary =
+    unsupported || settings.practice
+      ? `🎧 ${t('setup.modePractice')}`
+      : `🎤 ${t('setup.modeRecord')}`;
+  const dockSubtitle = isRandom
+    ? `${modeSummary} · ${settings.duration}s`
+    : `${armedBeat.bpm} BPM · ${beatText(armedBeat, 'mood', locale)}`;
+
+  const showDock = screen === 'landing' || screen === 'setup' || screen === 'beatSelect';
 
   return (
-    <div className="relative min-h-screen">
-      <div className="relative z-10 px-2 py-3 sm:px-4 sm:py-6">
-        <AppShell
-          onNavigate={handleNavigate}
-          beatCount={BEATS.length}
-          footer={
-            screen === 'beatSelect' ? (
-              <YourBeatBar
-                beat={armedBeat}
-                isRandom={isRandom}
-                subtitle={
-                  isRandom
-                    ? t('yourBeat.practice', { bars: 16, mood: t('freestyle.practiceMode') })
-                    : t('yourBeat.selected', {
-                        bpm: armedBeat?.bpm ?? 0,
-                        mood: armedBeat ? beatText(armedBeat, 'mood', locale) : '',
-                      })
-                }
-                onRandomize={handleShuffleBeat}
-                onPlay={() => {
-                  // With nothing armed, a random pick stands in. React batches
-                  // these two updates, so the session sees the armed beat.
-                  if (!selectedBeat) {
-                    setSelectedBeat(BEATS[Math.floor(Math.random() * BEATS.length)]);
+    <MotionConfig reducedMotion="user">
+      <div className="relative min-h-screen overflow-x-clip">
+        {/* Subtle ambient sunset wash behind the shell. */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none fixed inset-0 z-0"
+          style={{
+            background:
+              'radial-gradient(65% 42% at 50% -10%, rgb(var(--color-accent) / 0.13), transparent 70%), radial-gradient(48% 36% at 88% 12%, rgb(var(--color-tertiary) / 0.09), transparent 72%)',
+          }}
+        />
+
+        {/* Spring-animated floating Toast (GPU transform + opacity only) */}
+        <AnimatePresence>
+          {toast ? (
+            <motion.div
+              key={toast}
+              role="status"
+              aria-live="polite"
+              initial={{ opacity: 0, y: -14, x: '-50%', scale: 0.92 }}
+              animate={{ opacity: 1, y: 0, x: '-50%', scale: 1 }}
+              exit={{ opacity: 0, y: -10, x: '-50%', scale: 0.94 }}
+              transition={SPRING_BOUNCY}
+              className="fixed left-1/2 top-4 z-60 pointer-events-none rounded-full border border-accent/55 bg-surface-raised/95 px-4 py-2 text-xs font-medium text-content shadow-lift backdrop-blur-md"
+            >
+              {toast}
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+
+        <div className="relative z-10">
+          <AppShell
+            screen={screen}
+            runCount={runs.length}
+            onNavigate={handleNavigate}
+            beatCount={BEATS.length}
+            footer={
+              showDock ? (
+                <YourBeatBar
+                  beat={armedBeat}
+                  isRandom={isRandom}
+                  isPlaying={player.isPlaying}
+                  label={screen === 'setup' ? t('yourBeat.upNext') : t('yourBeat.label')}
+                  subtitle={dockSubtitle}
+                  showSettings={screen !== 'setup'}
+                  onOpenSettings={goToSetup}
+                  playLabel={
+                    screen === 'setup' ? t('yourBeat.go') : `${t('yourBeat.play')} ›`
                   }
-                  setScreen('freestyle');
-                }}
-              />
-            ) : null
-          }
-        >
-          {screen === 'landing' ? (
-            <LandingScreen
-              onStart={goToBeats}
-              onOpenBeats={goToBeats}
-              beatCount={BEATS.length}
-              supported={!unsupported}
-            />
-          ) : null}
+                  onPlay={() => launchFreestyle(true)}
+                />
+              ) : null
+            }
+          >
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div
+                key={screen}
+                variants={screenVariants}
+                initial="initial"
+                animate="animate"
+                exit="exit"
+              >
+                {screen === 'landing' ? (
+                  <LandingScreen
+                    onStart={() => launchFreestyle(true)}
+                    onOpenBeats={goToLanding}
+                    beatCount={BEATS.length}
+                    supported={!unsupported}
+                    beats={BEATS}
+                    player={player}
+                    selectedBeat={selectedBeat}
+                    onSelect={handleSelectBeat}
+                    onRandomize={handleRandomBeat}
+                  />
+                ) : null}
 
-          {screen === 'beatSelect' ? (
-            <BeatSelectScreen
-              beats={BEATS}
-              player={player}
-              selectedBeat={selectedBeat}
-              onSelect={handleSelectBeat}
-              onRandomize={handleRandomBeat}
-              onBack={goToLanding}
-            />
-          ) : null}
+                {screen === 'beatSelect' ? (
+                  <BeatSelectScreen
+                    beats={BEATS}
+                    player={player}
+                    selectedBeat={selectedBeat}
+                    onSelect={handleSelectBeat}
+                    onRandomize={handleRandomBeat}
+                    onBack={goToLanding}
+                  />
+                ) : null}
 
-          {screen === 'freestyle' ? (
-            <FreestyleScreen
-              beat={selectedBeat}
-              player={player}
-              recorder={recorder}
-              settings={settings}
-              onSettingsChange={setSettings}
-              onComplete={handleComplete}
-              onExit={goToBeats}
-              unsupported={unsupported}
-            />
-          ) : null}
+                {screen === 'setup' ? (
+                  <SetupScreen
+                    beat={selectedBeat}
+                    player={player}
+                    settings={settings}
+                    onSettingsChange={setSettings}
+                    onBack={goToLanding}
+                    unsupported={unsupported}
+                  />
+                ) : null}
 
-          {screen === 'results' && result ? (
-            <ResultsScreen
-              result={result}
-              onRestart={handleRestart}
-              onChangeBeat={handleChangeBeat}
-            />
-          ) : null}
-        </AppShell>
+                {screen === 'freestyle' ? (
+                  <FreestyleScreen
+                    beat={selectedBeat}
+                    player={player}
+                    recorder={recorder}
+                    settings={settings}
+                    onSettingsChange={setSettings}
+                    onComplete={handleComplete}
+                    onExit={goToLanding}
+                    unsupported={unsupported}
+                    autoStart={autoStartStage}
+                  />
+                ) : null}
+
+                {screen === 'results' && result ? (
+                  <ResultsScreen
+                    result={result}
+                    onRestart={handleRestart}
+                    onChangeBeat={handleChangeBeat}
+                    onHome={goToLanding}
+                  />
+                ) : null}
+
+                {screen === 'stats' ? (
+                  <StatsScreen
+                    runs={runs}
+                    onBack={goToLanding}
+                    onReset={handleResetStats}
+                  />
+                ) : null}
+              </motion.div>
+            </AnimatePresence>
+          </AppShell>
+        </div>
       </div>
-    </div>
+    </MotionConfig>
   );
 }

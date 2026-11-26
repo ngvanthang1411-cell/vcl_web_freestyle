@@ -70,6 +70,19 @@ export function snapToBeats(seconds, bpm) {
 }
 
 /**
+ * Snaps a desired interval to a whole number of 4/4 musical bars (multiples of
+ * 4 beats: 4, 8, 12, 16...) so every word explodes cleanly on Beat 1 of a bar
+ * (the heavy kick downbeat) instead of drifting onto off-beats like 5 or 7.
+ */
+export function snapToBarBeats(seconds, bpm) {
+  const spb = secondsPerBeat(bpm);
+  if (!spb) return 4;
+  const rawBeats = seconds / spb;
+  const bars = Math.max(1, Math.round(rawBeats / 4));
+  return bars * 4;
+}
+
+/**
  * How many beats fit in `seconds`, as a whole number.
  *
  * This is the interval the word generator should actually use: revealing on

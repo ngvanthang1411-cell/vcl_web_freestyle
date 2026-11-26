@@ -1,16 +1,21 @@
+import { motion } from 'framer-motion';
+import BeatCover from './BeatCover';
+import { BUTTON_HOVER, BUTTON_TAP, SPRING_SMOOTH, SPRING_SNAPPY } from '../lib/motion';
 import { useT } from '../i18n/LanguageContext';
 
 /**
- * The "Your beat" bar.
- *
- * A single strip showing the beat currently armed for the next session, with
- * the action to start it. It sits above the footer, so the play button is
- * always in the same place.
+ * Floating frosted bottom dock ("Your beat" / "Up next") with Framer Motion
+ * spring physics for tactile button feedback and smooth entrance.
  */
 export default function YourBeatBar({
   beat,
   subtitle,
   isRandom = false,
+  isPlaying = false,
+  label,
+  playLabel,
+  showSettings = false,
+  onOpenSettings,
   onRandomize,
   onPlay,
   playDisabled = false,
@@ -18,55 +23,78 @@ export default function YourBeatBar({
   const t = useT();
 
   return (
-    <div className="mt-8 flex items-center gap-3 rounded-lg border border-line px-4 py-3">
-      {/* Beat art */}
-      <div className="shrink-0">
-        {beat && !isRandom ? (
-          <img
-            src={`/waveforms/${beat.id}.png`}
-            alt=""
-            width={40}
-            height={40}
-            className="h-10 w-10 rounded-md bg-surface-overlay object-contain p-1"
-          />
-        ) : (
-          <span
-            aria-hidden="true"
-            className="flex h-10 w-10 items-center justify-center rounded-md bg-surface-overlay text-lg"
-          >
-            🎲
-          </span>
-        )}
-      </div>
+    <motion.div
+      initial={{ opacity: 0, y: 16 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={SPRING_SMOOTH}
+      className="ygb-dock"
+    >
+      <div className={`ygb-dock-in ${beat && !isRandom ? 'armed' : ''}`}>
+        {/* Beat art */}
+        <div className="shrink-0">
+          {beat && !isRandom ? (
+            <BeatCover beat={beat} playing={isPlaying} size="sm" />
+          ) : (
+            <span
+              aria-hidden="true"
+              className="flex h-10 w-10 items-center justify-center rounded-[10px] bg-surface-overlay text-lg shadow-inner"
+            >
+              🎲
+            </span>
+          )}
+        </div>
 
-      {/* Beat name + status */}
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-semibold text-content">
-          {beat && !isRandom ? beat.title : t('yourBeat.random')}
-        </p>
-        <p className="truncate text-xs text-content-muted">{subtitle}</p>
-      </div>
+        {/* Beat name + status */}
+        <div className="min-w-0 flex-1">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-content-subtle">
+            {label ?? t('yourBeat.label')}
+          </p>
+          <p className="truncate text-sm font-bold leading-tight text-content">
+            {beat && !isRandom ? beat.title : t('yourBeat.random')}
+          </p>
+          <p className="truncate text-[11px] text-content-muted">{subtitle}</p>
+        </div>
 
-      <div className="flex shrink-0 items-center gap-2">
-        {isRandom ? (
-          <button
+        <div className="flex shrink-0 items-center gap-2">
+          {showSettings && onOpenSettings ? (
+            <motion.button
+              type="button"
+              onClick={onOpenSettings}
+              aria-label={t('yourBeat.settingsAria')}
+              title={t('setup.title')}
+              whileHover={{ rotate: 40, scale: 1.05 }}
+              whileTap={{ scale: 0.92 }}
+              transition={SPRING_SNAPPY}
+              className="ygb-dock-gear"
+            >
+              ⚙
+            </motion.button>
+          ) : isRandom && onRandomize ? (
+            <motion.button
+              type="button"
+              onClick={onRandomize}
+              whileHover={BUTTON_HOVER}
+              whileTap={BUTTON_TAP}
+              transition={SPRING_SNAPPY}
+              className="btn btn-secondary hidden h-10 sm:inline-flex"
+            >
+              {t('yourBeat.shuffle')}
+            </motion.button>
+          ) : null}
+
+          <motion.button
             type="button"
-            onClick={onRandomize}
-            className="btn btn-secondary hidden h-9 sm:inline-flex"
+            onClick={onPlay}
+            disabled={playDisabled}
+            whileHover={playDisabled ? undefined : { y: -1.5, scale: 1.035 }}
+            whileTap={playDisabled ? undefined : { scale: 0.95 }}
+            transition={SPRING_SNAPPY}
+            className="ygb-dock-go"
           >
-            {t('yourBeat.shuffle')}
-          </button>
-        ) : null}
-
-        <button
-          type="button"
-          onClick={onPlay}
-          disabled={playDisabled}
-          className="btn btn-primary h-9 px-4"
-        >
-          {t('yourBeat.play')}
-        </button>
+            <span>{playLabel ?? `${t('yourBeat.play')} ›`}</span>
+          </motion.button>
+        </div>
       </div>
-    </div>
+    </motion.div>
   );
 }

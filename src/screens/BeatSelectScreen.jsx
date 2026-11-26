@@ -1,16 +1,21 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { motion } from 'framer-motion';
+import BeatCover from '../components/BeatCover';
 import { formatClock } from '../components/ui';
-import { beatText } from '../data/beats';
+import { BEAT_VIBES, beatText } from '../data/beats';
 import { useLanguage, useT } from '../i18n/LanguageContext';
+import {
+  BUTTON_HOVER,
+  BUTTON_TAP,
+  CARD_HOVER,
+  SPRING_SNAPPY,
+  cardContainerVariants,
+  cardItemVariants,
+} from '../lib/motion';
 
 /**
- * Beat selection — a list of beats with preview playback.
- *
- * Only one beat previews at a time; selecting a beat arms it for the
- * session.
- *
- * Each row carries a waveform thumbnail generated from the actual audio (see
- * scripts/generate-waveforms.mjs), so the art always matches the track.
+ * Beat selection — a list of beats with Framer Motion spring cards, animated
+ * covers, GPU scaleX progress rail, and preview playback.
  */
 export default function BeatSelectScreen({
   beats,
@@ -23,15 +28,32 @@ export default function BeatSelectScreen({
   const { play, pause, isPlaying, currentTime } = player;
   const { locale } = useLanguage();
   const t = useT();
-  // Which card is previewing, so a re-render reflects the transport state.
   const [activeBeatId, setActiveBeatId] = useState(null);
+  const [vibe, setVibe] = useState('All');
 
-  // Stop any preview when the screen unmounts.
   useEffect(() => {
     return () => {
       pause();
     };
   }, [pause]);
+
+  const vibeCounts = useMemo(() => {
+    const counts = { All: beats.length };
+    for (const b of beats) {
+      if (b.vibe) counts[b.vibe] = (counts[b.vibe] || 0) + 1;
+    }
+    return counts;
+  }, [beats]);
+
+  const availableVibes = useMemo(
+    () => BEAT_VIBES.filter((v) => v === 'All' || (vibeCounts[v] ?? 0) > 0),
+    [vibeCounts],
+  );
+
+  const visibleBeats = useMemo(() => {
+    if (vibe === 'All') return beats;
+    return beats.filter((b) => b.vibe === vibe);
+  }, [beats, vibe]);
 
   const handlePreview = async (beat) => {
     if (activeBeatId === beat.id && isPlaying) {
@@ -51,159 +73,162 @@ export default function BeatSelectScreen({
 
   return (
     <div>
-      <h1 className="text-[clamp(1.75rem,5vw,2.5rem)] font-semibold leading-tight tracking-tight text-content">
+      <h1 className="text-[clamp(1.75rem,5vw,2.5rem)] font-bold leading-tight tracking-tight text-content">
         {t('beats.titlePrefix')}{' '}
-        <span className="text-accent">{t('beats.titleAccent')}</span>
+        <span className="bg-gradient-to-r from-accent to-secondary bg-clip-text text-transparent">
+          {t('beats.titleAccent')}
+        </span>
       </h1>
-      <p className="mt-2 text-sm text-content-muted">
+      <p className="mt-1.5 text-sm text-content-muted">
         {t('beats.subtitle', { count: beats.length })}
       </p>
 
-      <ul className="mt-8 space-y-3">
-        {/* The random pick — the default way in, and always the first row. */}
-        <li>
-          <button
-            type="button"
-            onClick={onRandomize}
-            className="flex w-full items-center gap-4 rounded-lg border border-line px-4 py-3 text-left transition-colors hover:border-line-strong"
-          >
-            <span
-              aria-hidden="true"
-              className="flex h-12 w-12 shrink-0 items-center justify-center rounded-md bg-surface-overlay text-xl"
+      {availableVibes.length > 1 ? (
+        <div className="ygb-vibes mt-5">
+          {availableVibes.map((item) => (
+            <motion.button
+              key={item}
+              type="button"
+              whileHover={{ y: -1 }}
+              whileTap={{ scale: 0.95 }}
+              transition={SPRING_SNAPPY}
+              onClick={() => setVibe(item)}
+              className={`ygb-vibe ${vibe === item ? 'on' : ''}`}
             >
-              🎲
-            </span>
-            <span className="min-w-0 flex-1">
-              <span className="block text-base font-semibold tracking-tight text-content">
-                {t('beats.randomTitle')}
-              </span>
-              <span className="mt-0.5 block truncate text-xs text-content-muted">
-                {t('beats.randomBody')}
-              </span>
-            </span>
-          </button>
-        </li>
+              <span>{item === 'All' ? t('home.vibeAll') : item}</span>
+              <small>{vibeCounts[item] ?? 0}</small>
+            </motion.button>
+          ))}
+        </div>
+      ) : null}
 
-        {beats.map((beat) => {
+      <motion.ul
+        key={vibe}
+        variants={cardContainerVariants}
+        initial="initial"
+        animate="animate"
+        className="mt-5 space-y-2.5"
+      >
+        {vibe === 'All' ? (
+          <motion.li variants={cardItemVariants}>
+            <motion.button
+              type="button"
+              whileHover={CARD_HOVER}
+              whileTap={{ scale: 0.985 }}
+              transition={SPRING_SNAPPY}
+              onClick={onRandomize}
+              className={`ygb-beat-card flex w-full items-center gap-3.5 p-3 text-left ${
+                !selectedBeat ? 'on' : ''
+              }`}
+            >
+              <span
+                aria-hidden="true"
+                className="flex h-[3.15rem] w-[3.15rem] shrink-0 items-center justify-center rounded-[11px] bg-surface-overlay text-xl"
+              >
+                🎲
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-bold tracking-tight text-content">
+                  {t('beats.randomTitle')}
+                </span>
+                <span className="mt-0.5 block truncate text-xs text-content-muted">
+                  {t('beats.randomBody')}
+                </span>
+              </span>
+            </motion.button>
+          </motion.li>
+        ) : null}
+
+        {visibleBeats.map((beat) => {
           const previewing = activeBeatId === beat.id && isPlaying;
-          const progress = previewing && beat.duration
-            ? Math.min(100, (currentTime / beat.duration) * 100)
-            : 0;
+          const selected = selectedBeat?.id === beat.id;
+          const ratio =
+            previewing && beat.duration
+              ? Math.min(1, Math.max(0, currentTime / beat.duration))
+              : 0;
 
           return (
-            <li key={beat.id}>
-              <div
-                className={`rounded-lg border px-4 py-3 ${
-                  selectedBeat?.id === beat.id ? 'border-accent/60' : 'border-line'
+            <motion.li key={beat.id} variants={cardItemVariants}>
+              <motion.div
+                whileHover={CARD_HOVER}
+                transition={SPRING_SNAPPY}
+                className={`ygb-beat-card p-3 ${selected ? 'on' : ''} ${
+                  previewing ? 'playing' : ''
                 }`}
               >
-                {/* The art and the text sit side by side. On narrow screens
-                    the actions drop below, so the title and mood get the
-                    full width instead of being squeezed by the buttons. */}
                 <div className="flex items-center gap-3">
-                  <img
-                    src={`/waveforms/${beat.id}.png`}
-                    alt=""
-                    width={48}
-                    height={48}
-                    className="h-12 w-12 shrink-0 rounded-md bg-surface-overlay object-contain p-1"
-                    loading="lazy"
-                  />
+                  <BeatCover beat={beat} playing={previewing} />
 
                   <div className="min-w-0 flex-1">
-                    <p className="text-base font-semibold leading-tight tracking-tight text-content">
+                    <p className="truncate text-sm font-bold leading-tight tracking-tight text-content">
                       {beat.title}
                     </p>
-                    <p className="mt-0.5 text-xs leading-snug text-content-muted">
+                    <p className="mt-0.5 truncate text-xs leading-snug text-content-muted">
                       {beatText(beat, 'mood', locale)}
                     </p>
-                    <p className="mt-1 font-mono text-xs tnum text-content-subtle">
-                      {beat.bpm} BPM · {formatClock(beat.duration)}
+                    <p className="mt-1 font-mono text-[11px] tnum text-content-subtle">
+                      <span className="text-accent-light">{beat.bpm} BPM</span> ·{' '}
+                      {formatClock(beat.duration)}
                     </p>
-
-                    {/* The preview progress, shown while the row is playing. */}
-                    {previewing ? (
-                      <div aria-hidden="true" className="track mt-2 h-[3px]">
-                        <div className="track-fill" style={{ width: `${progress}%` }} />
-                      </div>
-                    ) : null}
                   </div>
 
-                  <div className="hidden shrink-0 items-center gap-2 sm:flex">
-                    <button
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <motion.button
                       type="button"
+                      whileHover={{ scale: 1.07 }}
+                      whileTap={{ scale: 0.92 }}
+                      transition={SPRING_SNAPPY}
                       onClick={() => handlePreview(beat)}
                       aria-label={
                         previewing
                           ? t('beats.pauseAria', { title: beat.title })
                           : t('beats.previewAria', { title: beat.title })
                       }
-                      className="btn btn-ghost h-9 w-9 p-0"
+                      className="ygb-icon-btn h-9 w-9 text-xs"
                     >
-                      {previewing ? <PauseIcon /> : <PlayIcon />}
-                    </button>
+                      {previewing ? '❚❚' : '▶'}
+                    </motion.button>
 
-                    <button
+                    <motion.button
                       type="button"
+                      whileHover={BUTTON_HOVER}
+                      whileTap={BUTTON_TAP}
+                      transition={SPRING_SNAPPY}
                       onClick={() => handleSelect(beat)}
-                      className="btn btn-secondary h-9"
+                      className="btn btn-secondary h-9 px-3 text-xs"
                     >
                       {t('beats.select')}
-                    </button>
+                    </motion.button>
                   </div>
                 </div>
 
-                {/* On mobile the same actions, stacked below the text. */}
-                <div className="mt-3 flex items-center gap-2 sm:hidden">
-                  <button
-                    type="button"
-                    onClick={() => handlePreview(beat)}
-                    aria-label={
-                      previewing
-                        ? t('beats.pauseAria', { title: beat.title })
-                        : t('beats.previewAria', { title: beat.title })
-                    }
-                    className="btn btn-ghost h-9 w-9 p-0"
-                  >
-                    {previewing ? <PauseIcon /> : <PlayIcon />}
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => handleSelect(beat)}
-                    className="btn btn-secondary h-9 flex-1"
-                  >
-                    {t('beats.select')}
-                  </button>
+                {/* GPU-only scaleX preview progress */}
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-x-0 bottom-0 h-[2.5px] bg-line/40 transition-opacity duration-200"
+                  style={{ opacity: previewing ? 1 : 0 }}
+                >
+                  <div
+                    className="h-full w-full origin-left bg-gradient-to-r from-accent via-accent-light to-secondary will-change-transform transition-transform duration-150 ease-linear"
+                    style={{ transform: `scaleX(${ratio.toFixed(4)})` }}
+                  />
                 </div>
-              </div>
-            </li>
+              </motion.div>
+            </motion.li>
           );
         })}
-      </ul>
+      </motion.ul>
 
-      <button type="button" onClick={onBack} className="btn btn-ghost mt-8">
-        {t('beats.back')}
-      </button>
+      <motion.button
+        type="button"
+        whileHover={BUTTON_HOVER}
+        whileTap={BUTTON_TAP}
+        transition={SPRING_SNAPPY}
+        onClick={onBack}
+        className="btn btn-ghost mt-6"
+      >
+        ‹ {t('beats.back')}
+      </motion.button>
     </div>
-  );
-}
-
-/** Play triangle. */
-function PlayIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor" aria-hidden="true">
-      <path d="M4 2.5v9l7-4.5z" />
-    </svg>
-  );
-}
-
-/** Pause bars. */
-function PauseIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor" aria-hidden="true">
-      <rect x="3.5" y="2.5" width="2.5" height="9" rx="0.5" />
-      <rect x="8" y="2.5" width="2.5" height="9" rx="0.5" />
-    </svg>
   );
 }
