@@ -16,12 +16,14 @@ import {
 } from '../lib/motion';
 
 /**
- * The Home screen (`#home`) powered by Framer Motion spring physics and
- * an isolated 60fps BeatPulseBar synced to Web Audio API.
+ * The Home screen (`#home`) powered by Framer Motion spring physics,
+ * 60fps BeatPulseBar, and Custom Beat Upload right in the Beat Crate.
  */
 export default function LandingScreen({
   onStart,
   onOpenBeats,
+  onOpenUpload = null,
+  onDeleteCustomBeat = null,
   beatCount,
   supported,
   beats = [],
@@ -133,7 +135,7 @@ export default function LandingScreen({
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ ...SPRING_SMOOTH, delay: 0.12 }}
-          className="mt-5 flex justify-center"
+          className="mt-5 flex flex-wrap justify-center gap-2.5"
         >
           <motion.button
             type="button"
@@ -145,6 +147,19 @@ export default function LandingScreen({
           >
             {t('landing.ctaStart')} ›
           </motion.button>
+
+          {onOpenUpload ? (
+            <motion.button
+              type="button"
+              onClick={onOpenUpload}
+              whileHover={BUTTON_HOVER}
+              whileTap={BUTTON_TAP}
+              transition={SPRING_SNAPPY}
+              className="btn btn-secondary rounded-full px-4 py-2.5 text-sm"
+            >
+              ⬆️ {t('upload.ctaBtn')}
+            </motion.button>
+          ) : null}
         </motion.div>
 
         {!supported ? (
@@ -161,17 +176,28 @@ export default function LandingScreen({
             <h2 id="crate-heading" className="text-base font-bold tracking-tight text-content">
               {t('home.pickBeat')}
             </h2>
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-accent/35 bg-accent/10 px-2.5 py-0.5 text-[11px] font-semibold text-accent-lighter">
-              <span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden="true" />
-              {t('home.freshBadge', { count: beatCount })}
-            </span>
+            <div className="flex items-center gap-2">
+              {onOpenUpload ? (
+                <button
+                  type="button"
+                  onClick={onOpenUpload}
+                  className="inline-flex items-center gap-1 rounded-full border border-line-strong bg-surface-raised px-2.5 py-0.5 text-[11px] font-semibold text-content-muted transition-colors hover:border-accent/60 hover:text-accent-lighter"
+                >
+                  ＋ {t('upload.shortBtn')}
+                </button>
+              ) : null}
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-accent/35 bg-accent/10 px-2.5 py-0.5 text-[11px] font-semibold text-accent-lighter">
+                <span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden="true" />
+                {t('home.freshBadge', { count: beatCount })}
+              </span>
+            </div>
           </div>
 
           <p className="text-xs text-content-muted">
             {t('beats.subtitle', { count: beatCount })}
           </p>
 
-          {/* Isolated 60fps Beat Pulse Bar — stays mounted cleanly so zero layout shift */}
+          {/* Isolated 60fps Beat Pulse Bar */}
           {player ? (
             <BeatPulseBar
               audio={player.audio}
@@ -202,7 +228,7 @@ export default function LandingScreen({
             ))}
           </div>
 
-          {/* Crate list with Framer Motion spring stagger */}
+          {/* Crate list */}
           <motion.div
             key={vibe}
             variants={cardContainerVariants}
@@ -254,29 +280,40 @@ export default function LandingScreen({
                   : 0;
 
               return (
-                <motion.button
+                <motion.div
                   key={beat.id}
-                  type="button"
                   variants={cardItemVariants}
                   whileHover={CARD_HOVER}
                   whileTap={CARD_TAP}
                   transition={SPRING_SNAPPY}
                   onClick={() => handleBeatTap(beat)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      handleBeatTap(beat);
+                    }
+                  }}
                   aria-label={
                     previewing
                       ? t('beats.pauseAria', { title: beat.title })
                       : t('beats.previewAria', { title: beat.title })
                   }
-                  className={`ygb-beat-card flex w-full items-center gap-3.5 p-3 text-left ${
+                  className={`ygb-beat-card flex w-full cursor-pointer items-center gap-3.5 p-3 text-left ${
                     armed ? 'on' : ''
                   } ${previewing ? 'playing' : ''}`}
                 >
                   <BeatCover beat={beat} playing={previewing} />
 
                   <span className="min-w-0 flex-1">
-                    <span className="flex items-center gap-2">
+                    <span className="flex items-center gap-1.5">
                       <span className="truncate text-sm font-bold text-content">{beat.title}</span>
-                      {beat.vibe ? (
+                      {beat.isCustom ? (
+                        <span className="rounded-full bg-accent/20 px-2 py-0.5 text-[10px] font-bold text-accent-lighter">
+                          Upload
+                        </span>
+                      ) : beat.vibe ? (
                         <span className="rounded-full bg-surface-overlay px-2 py-0.5 text-[10px] font-semibold text-content-subtle">
                           {beat.vibe}
                         </span>
@@ -290,17 +327,37 @@ export default function LandingScreen({
                     </span>
                   </span>
 
-                  <span
-                    aria-hidden="true"
-                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-xs transition-colors duration-200 ${
-                      previewing
-                        ? 'border-accent bg-accent text-content-inverse shadow-[0_0_16px_rgb(var(--color-accent)/0.5)]'
-                        : armed
-                          ? 'border-accent/60 bg-accent/15 text-accent-light'
-                          : 'border-line bg-surface-overlay/80 text-content-muted'
-                    }`}
-                  >
-                    {previewing ? '❚❚' : '▶'}
+                  <span className="flex shrink-0 items-center gap-1.5">
+                    {beat.isCustom && onDeleteCustomBeat ? (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (previewId === beat.id) {
+                            player?.pause?.();
+                            setPreviewId(null);
+                          }
+                          onDeleteCustomBeat(beat.id);
+                        }}
+                        aria-label={t('upload.deleteAria', { title: beat.title })}
+                        className="flex h-7 w-7 items-center justify-center rounded-full border border-line bg-surface-overlay/80 text-[10px] text-content-subtle hover:border-danger/60 hover:text-danger"
+                      >
+                        ✕
+                      </button>
+                    ) : null}
+
+                    <span
+                      aria-hidden="true"
+                      className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-xs transition-colors duration-200 ${
+                        previewing
+                          ? 'border-accent bg-accent text-content-inverse shadow-[0_0_16px_rgb(var(--color-accent)/0.5)]'
+                          : armed
+                            ? 'border-accent/60 bg-accent/15 text-accent-light'
+                            : 'border-line bg-surface-overlay/80 text-content-muted'
+                      }`}
+                    >
+                      {previewing ? '❚❚' : '▶'}
+                    </span>
                   </span>
 
                   {/* GPU-only scaleX preview progress hairline */}
@@ -314,7 +371,7 @@ export default function LandingScreen({
                       style={{ transform: `scaleX(${ratio.toFixed(4)})` }}
                     />
                   </span>
-                </motion.button>
+                </motion.div>
               );
             })}
           </motion.div>

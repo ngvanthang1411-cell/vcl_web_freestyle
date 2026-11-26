@@ -1,11 +1,12 @@
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { motion } from 'framer-motion';
 import BeatCover from '../components/BeatCover';
 import BeatPulseBar from '../components/BeatPulseBar';
-import { SegmentedControl, SliderField } from '../components/ui';
+import { SegmentedControl } from '../components/ui';
 import { beatText } from '../data/beats';
 import { useLanguage, useT } from '../i18n/LanguageContext';
-import { snapToBarBeats } from '../lib/beatGrid';
+import { getRhymeBankStats, resolveRoundBars } from '../lib/rhymeEngine';
+import { findUserByHandleOrAccount } from '../lib/vclStore';
 import {
   BUTTON_HOVER,
   BUTTON_TAP,
@@ -16,18 +17,14 @@ import {
   cardItemVariants,
 } from '../lib/motion';
 
-function formatBeatInterval(seconds, bpm) {
-  if (!bpm) return seconds;
-  const beats = snapToBarBeats(seconds, bpm);
-  return Number((beats * (60 / bpm)).toFixed(2));
-}
-
 /**
- * Round Settings screen (`#setup`).
- *
- * Uses Framer Motion spring cards & switches, and embeds the memoized 60fps
- * `BeatPulseBar` decoupled from text inputs so typing handles never interrupts
- * the beat visualizer.
+ * Round Settings screen (`#setup`) implementing Spec Section 2 & 6:
+ *  - Mode: Luyện tập (Practice) vs Thi (Compete — records camera + mic, submittable)
+ *  - Format: Solo vs Đấu 2 người (Battle — 2 players alternating every 2 bars)
+ *  - Length: 8 / 16 (default) / 32 bar / Cả bài
+ *  - Difficulty: Dễ (default) / Vừa / Khó (from Kho vần VCL v0)
+ *  - Flow: Phách 4 (1 word/bar, default) · Phách 2 & 4 (2 words/bar)
+ *  - Count-in: Bật (4 bar, default) / Tắt
  */
 export default function SetupScreen({
   beat,
@@ -36,6 +33,7 @@ export default function SetupScreen({
   onSettingsChange,
   onBack,
   unsupported,
+  user = null,
 }) {
   const { locale } = useLanguage();
   const t = useT();
@@ -45,7 +43,16 @@ export default function SetupScreen({
     return () => pause();
   }, [pause]);
 
-  const bpm = beat?.bpm ?? 0;
+  const bpm = beat?.bpm ?? 96;
+  const bankStats = useMemo(() => getRhymeBankStats(), []);
+  const resolvedBars = resolveRoundBars(settings.bars ?? 16, beat);
+  const estSeconds = Math.round((resolvedBars * 4 * 60) / Math.max(60, bpm));
+  const wordsTotal = resolvedBars * (settings.flow === 'beat24' ? 2 : 1);
+
+  const matchedOpponent = useMemo(
+    () => (settings.battleMode && settings.opponent ? findUserByHandleOrAccount(settings.opponent) : null),
+    [settings.battleMode, settings.opponent],
+  );
 
   const togglePreview = async () => {
     if (!beat) return;
@@ -98,7 +105,7 @@ export default function SetupScreen({
             </p>
             <p className="mt-0.5 truncate text-xs text-content-muted">
               {beat
-                ? `${beat.bpm} BPM · ${beatText(beat, 'mood', locale)}`
+                ? `${beat.bpm} BPM · ${beat.totalBars || 32} bar · ${beatText(beat, 'mood', locale)}`
                 : t('beats.randomBody')}
             </p>
           </div>
@@ -124,13 +131,13 @@ export default function SetupScreen({
         <BeatPulseBar
           audio={audio}
           analyserRef={analyserRef}
-          bpm={bpm}
+          bpm={beat?.bpm ?? 0}
           isPlaying={isPlaying}
           compact
         />
       </motion.div>
 
-      {/* Practice vs Record 2-card selector */}
+      {/* Practice vs Compete (Thi) 2-card selector */}
       <motion.div
         variants={cardItemVariants}
         role="radiogroup"
@@ -164,15 +171,15 @@ export default function SetupScreen({
           whileHover={unsupported ? undefined : CARD_HOVER}
           whileTap={unsupported ? undefined : CARD_TAP}
           transition={SPRING_SNAPPY}
-          onClick={() => onSettingsChange({ ...settings, practice: false })}
+          onClick={() => onSettingsChange({ ...settings, practice: false, video: true })}
           className={`ygb-mode-card ${!settings.practice && !unsupported ? 'on' : ''} disabled:cursor-not-allowed disabled:opacity-45`}
         >
           <span className="text-xl" aria-hidden="true">
-            🎤
+            🏆
           </span>
-          <b className="mt-1 text-sm font-bold text-content">{t('setup.modeRecord')}</b>
+          <b className="mt-1 text-sm font-bold text-content">{t('setup.modeCompete')}</b>
           <small className="text-xs leading-snug text-content-muted">
-            {t('setup.modeRecordDesc')}
+            {t('setup.modeCompeteDesc')}
           </small>
         </motion.button>
       </motion.div>
@@ -206,7 +213,7 @@ export default function SetupScreen({
             <input
               type="text"
               maxLength={28}
-              value={settings.handle ?? ''}
+              value={settings.handle || user?.socialHandle || ''}
               onChange={(e) =>
                 onSettingsChange({ ...settings, handle: e.target.value.replace(/^@+/, '') })
               }
@@ -239,44 +246,109 @@ export default function SetupScreen({
           ) : null}
         </div>
 
-        <p className="text-[11px] leading-snug text-content-subtle">
-          {settings.battleMode ? t('setup.battleNote') : t('setup.handleNote')}
-        </p>
+        {settings.battleMode && settings.opponent ? (
+          <p className="text-[11px] font-medium">
+            {matchedOpponent ? (
+              <span className="text-success">
+                ✓ {t('setup.opponentLinked', { name: matchedOpponent.displayName })}
+              </span>
+            ) : (
+              <span className="text-content-subtle">{t('setup.opponentGuest')}</span>
+            )}
+          </p>
+        ) : (
+          <p className="text-[11px] leading-snug text-content-subtle">
+            {settings.battleMode ? t('setup.battleNote') : t('setup.handleNote')}
+          </p>
+        )}
       </motion.div>
 
-      {/* Round core options */}
+      {/* Official VCL Round Settings (Spec Section 2) */}
       <motion.div variants={cardItemVariants} className="panel space-y-5 p-4">
-        <p className="kicker">{t('setup.roundHeading')}</p>
+        <div className="flex items-center justify-between gap-2">
+          <p className="kicker">{t('setup.roundHeading')}</p>
+          <span className="font-mono text-[11px] text-accent-light tnum">
+            {resolvedBars} bar · {wordsTotal} {t('setup.wordsUnit')} · ~{estSeconds}s
+          </span>
+        </div>
 
+        {/* Độ dài: 8 / 16 / 32 bar / Cả bài */}
         <SegmentedControl
-          name="setup-duration"
-          label={t('freestyle.sessionLength')}
-          value={settings.duration}
-          onChange={(value) => onSettingsChange({ ...settings, duration: value })}
-          options={[30, 60, 90].map((seconds) => ({
-            value: seconds,
-            label: `${seconds}s`,
-          }))}
+          name="setup-bars"
+          label={t('setup.barsLabel')}
+          value={settings.bars ?? 16}
+          onChange={(value) => onSettingsChange({ ...settings, bars: value })}
+          options={[
+            { value: 8, label: '8 bar' },
+            { value: 16, label: '16 bar' },
+            { value: 32, label: '32 bar' },
+            { value: 'full', label: t('setup.fullTrack') },
+          ]}
         />
 
-        <SliderField
-          id="setup-word-interval"
-          label={t('freestyle.wordInterval')}
-          value={settings.wordInterval}
-          min={2}
-          max={10}
-          step={1}
-          onChange={(value) => onSettingsChange({ ...settings, wordInterval: value })}
-          format={(v) => `${formatBeatInterval(v, bpm)}s`}
-          note={
-            bpm
-              ? t('freestyle.beatsCount', {
-                  n: snapToBarBeats(settings.wordInterval, bpm),
-                })
-              : null
-          }
-          hint={t('freestyle.wordIntervalHint')}
-        />
+        {/* Độ khó: Dễ / Vừa / Khó */}
+        <div className="space-y-1.5">
+          <SegmentedControl
+            name="setup-difficulty"
+            label={t('setup.difficultyLabel')}
+            value={settings.difficulty ?? 'easy'}
+            onChange={(value) => onSettingsChange({ ...settings, difficulty: value })}
+            options={[
+              { value: 'easy', label: t('setup.diffEasy') },
+              { value: 'medium', label: t('setup.diffMedium') },
+              { value: 'hard', label: t('setup.diffHard') },
+            ]}
+          />
+          <p className="text-[11px] text-content-subtle">
+            {t('setup.rhymeBankHint', {
+              total: bankStats.totalOk,
+              nests: bankStats.totalNests,
+              count: bankStats.byLevel[settings.difficulty ?? 'easy'] ?? 0,
+            })}
+          </p>
+        </div>
+
+        {/* Flow: Phách 4 · Phách 2 & 4 */}
+        <div className="space-y-1.5">
+          <SegmentedControl
+            name="setup-flow"
+            label={t('setup.flowLabel')}
+            value={settings.flow ?? 'beat4'}
+            onChange={(value) => onSettingsChange({ ...settings, flow: value })}
+            options={[
+              { value: 'beat4', label: t('setup.flowBeat4') },
+              { value: 'beat24', label: t('setup.flowBeat24') },
+            ]}
+          />
+          <p className="text-[11px] text-content-subtle">
+            {(settings.flow ?? 'beat4') === 'beat4'
+              ? t('setup.flowBeat4Hint')
+              : t('setup.flowBeat24Hint')}
+          </p>
+        </div>
+
+        {/* Đếm vào: Bật (4 bar) / Tắt */}
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium text-content">{t('setup.countInLabel')}</p>
+            <p className="text-[11px] leading-snug text-content-subtle">
+              {t('setup.countInHint')}
+            </p>
+          </div>
+          <motion.button
+            type="button"
+            role="switch"
+            aria-checked={settings.countIn !== false}
+            whileTap={{ scale: 0.94 }}
+            transition={SPRING_SNAPPY}
+            onClick={() =>
+              onSettingsChange({ ...settings, countIn: !(settings.countIn !== false) })
+            }
+            className="ygb-switch shrink-0"
+          >
+            <span className="ygb-switch-thumb" />
+          </motion.button>
+        </div>
       </motion.div>
 
       {/* Collapsible Advanced Settings */}
@@ -294,17 +366,6 @@ export default function SetupScreen({
         </summary>
 
         <div className="space-y-5 border-t border-line/80 p-4">
-          <SegmentedControl
-            name="setup-word-mode"
-            label={t('freestyle.wordOrder')}
-            value={settings.wordMode}
-            onChange={(value) => onSettingsChange({ ...settings, wordMode: value })}
-            options={[
-              { value: 'random', label: t('freestyle.random') },
-              { value: 'sequential', label: t('freestyle.sequential') },
-            ]}
-          />
-
           <div className="flex items-center justify-between gap-4">
             <div>
               <p className="text-sm font-medium text-content">{t('freestyle.burnMode')}</p>
@@ -330,7 +391,7 @@ export default function SetupScreen({
               <div>
                 <p className="text-sm font-medium text-content">{t('recorder.recordVideo')}</p>
                 <p className="text-[11px] leading-snug text-content-subtle">
-                  {t('setup.modeRecordDesc')}
+                  {t('setup.modeCompeteDesc')}
                 </p>
               </div>
               <motion.button

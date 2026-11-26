@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import BeatPlayer from '../components/BeatPlayer';
@@ -10,6 +10,8 @@ import MicBadge from '../components/MicBadge';
 import StageCanvas from '../components/StageCanvas';
 import { useT } from '../i18n/LanguageContext';
 import { snapToBarBeats } from '../lib/beatGrid';
+import { resolveRoundBars } from '../lib/rhymeEngine';
+import { calculateMachineScore, isSpeechRecognitionSupported } from '../lib/speechMatcher';
 import { BUTTON_HOVER, BUTTON_TAP, SPRING_SMOOTH, SPRING_SNAPPY } from '../lib/motion';
 
 function formatBeatInterval(seconds, bpm) {
@@ -21,17 +23,11 @@ function formatBeatInterval(seconds, bpm) {
 /**
  * The freestyle stage screen (`#play`).
  *
- * Beat Engine & Performance Architecture:
- *  - Starting a session immediately launches the Web Audio beat at Beat 0
- *    (zero silent setTimeout countdown). Beats 0..15 run the musical 16-beat
- *    intro (`1-2-3-4` ×3 + `3-2-1-GO!`), and Beat 16 explodes the first word
- *    into the target box.
- *  - Session progress (`scaleX`) and remaining-seconds readout are driven by
- *    `requestAnimationFrame` via direct DOM refs (ZERO `setInterval`, ZERO
- *    10Hz React re-renders).
- *  - The lyrics scratchpad (`StageLyricsDrawer` & `IsolatedLyricsPad`) owns
- *    its own isolated React state, so continuous typing never re-renders the
- *    BeatEngine, countdown, or target-box explosions.
+ * Implements VCL Freestyle game loop:
+ *  - Count-in 4 bars (optional), then beat runs for 8 / 16 / 32 bars or full track.
+ *  - Words drop from Kho vần VCL v0 on Beat 4 or Beats 2 & 4.
+ *  - Live Vietnamese Web Speech API checks words within ±1 beat -> machine score (0..10).
+ *  - Battle mode alternates players every 2 bars and tracks P1 / P2 hits separately.
  */
 export default function FreestyleScreen({
   beat,
@@ -43,6 +39,7 @@ export default function FreestyleScreen({
   onExit,
   unsupported,
   autoStart = false,
+  user = null,
 }) {
   const t = useT();
   const [phase, setPhase] = useState('setup'); // setup | running | finished
@@ -52,6 +49,7 @@ export default function FreestyleScreen({
   const [hitsOnBeat, setHitsOnBeat] = useState(0);
   const [streak, setStreak] = useState(0);
   const [burstKey, setBurstKey] = useState(0);
+  const [activePlayer, setActivePlayer] = useState(1);
   const [practiceMode, setPracticeMode] = useState(Boolean(unsupported || settings.practice));
 
   // Direct DOM refs for zero-re-render 60fps session progress bar & timer text.
@@ -63,6 +61,8 @@ export default function FreestyleScreen({
   const recordedBlobRef = useRef(null);
   const finishedRef = useRef(false);
   const wordLogRef = useRef([]);
+  const tuRoiMapRef = useRef(new Map());
+  const speechOkRef = useRef(isSpeechRecognitionSupported());
   const autoStartedRef = useRef(false);
 
   const {
@@ -77,6 +77,26 @@ export default function FreestyleScreen({
 
   const { play, pause, toggleLoop } = player;
   const bpm = beat?.bpm ?? 0;
+  const effectiveBpm = bpm > 0 ? bpm : 120;
+  const countInEnabled = settings.countIn !== false;
+  const introBeats = countInEnabled ? INTRO_BEATS : 0;
+  const bar1Offset = beat?.bar1Offset ?? 0;
+
+  const roundBars = useMemo(
+    () => resolveRoundBars(settings.bars ?? 16, beat),
+    [settings.bars, beat],
+  );
+
+  // Target rap duration locked to exact musical bars (+0.85s tail for final beat 4 speech window)
+  const targetRapSeconds = useMemo(() => {
+    if (settings.bars !== undefined) {
+      return Number((((roundBars * 4 + 1.5) * 60) / effectiveBpm).toFixed(2));
+    }
+    return settings.duration || 60;
+  }, [settings.bars, settings.duration, roundBars, effectiveBpm]);
+
+  const player1Handle = settings.handle || user?.socialHandle || 'Player1';
+  const player2Handle = settings.opponent || 'Player2';
 
   /* ------------------------------------------------------------- cleanup */
 
@@ -102,20 +122,58 @@ export default function FreestyleScreen({
       }
 
       const audioElapsed = player.audio?.elapsedTime ?? 0;
-      const introOffset = rapStartAudioSecRef.current ?? (bpm > 0 ? (INTRO_BEATS * 60) / bpm : 8);
+      const introOffset =
+        rapStartAudioSecRef.current ?? (introBeats * 60) / effectiveBpm + bar1Offset;
       const rapSeconds = Math.max(0, audioElapsed - introOffset);
+
+      const tuRoi = Array.from(tuRoiMapRef.current.values()).sort(
+        (a, b) => (a.order || 0) - (b.order || 0),
+      );
+
+      const totalWords = tuRoi.length || wordsShown;
+      const hitCount = tuRoi.length
+        ? tuRoi.filter((w) => w.status === 'hit').length
+        : wordsHit;
+
+      const p1Items = tuRoi.filter((w) => w.playerIndex === 1);
+      const p2Items = tuRoi.filter((w) => w.playerIndex === 2);
+      const p1Hits = p1Items.filter((w) => w.status === 'hit').length;
+      const p2Hits = p2Items.filter((w) => w.status === 'hit').length;
+
+      const machineScore = speechOkRef.current ? calculateMachineScore(hitCount, totalWords) : 0;
+      const p1MachineScore = speechOkRef.current
+        ? calculateMachineScore(p1Hits, p1Items.length || totalWords)
+        : 0;
+      const p2MachineScore = speechOkRef.current
+        ? calculateMachineScore(p2Hits, p2Items.length)
+        : 0;
 
       onComplete({
         beatId: beat?.id ?? null,
         beatTitle: beat?.title ?? null,
-        handle: settings.handle ?? '',
-        durationSeconds: completed ? settings.duration : rapSeconds,
-        targetSeconds: settings.duration,
-        wordsShown,
-        wordsHit,
-        wordsMissed,
+        beatBpm: bpm || effectiveBpm,
+        handle: player1Handle,
+        opponent: settings.battleMode ? player2Handle : '',
+        battleMode: Boolean(settings.battleMode),
+        bars: roundBars,
+        flow: settings.flow ?? 'beat4',
+        difficulty: settings.difficulty ?? 'easy',
+        durationSeconds: completed ? targetRapSeconds : rapSeconds,
+        targetSeconds: targetRapSeconds,
+        wordsShown: totalWords,
+        wordsHit: hitCount,
+        wordsMissed: Math.max(0, totalWords - hitCount),
         perfectHits: hitsOnBeat,
+        machineScore,
+        p1WordsTotal: p1Items.length,
+        p1WordsHit: p1Hits,
+        p1MachineScore,
+        p2WordsTotal: p2Items.length,
+        p2WordsHit: p2Hits,
+        p2MachineScore,
+        speechSupported: speechOkRef.current,
         wordLog: [...wordLogRef.current],
+        tuRoi,
         completed,
         practiceMode,
         blob,
@@ -124,19 +182,26 @@ export default function FreestyleScreen({
       });
     },
     [
+      bar1Offset,
       beat,
       bpm,
+      effectiveBpm,
       hasVideo,
       hitsOnBeat,
+      introBeats,
       onComplete,
       player.audio,
+      player1Handle,
+      player2Handle,
       practiceMode,
       recorderState,
-      settings.duration,
-      settings.handle,
+      roundBars,
+      settings.battleMode,
+      settings.difficulty,
+      settings.flow,
       stop,
+      targetRapSeconds,
       wordsHit,
-      wordsMissed,
       wordsShown,
     ],
   );
@@ -151,9 +216,8 @@ export default function FreestyleScreen({
   useEffect(() => {
     if (phase !== 'running' || typeof window === 'undefined') return undefined;
 
-    const effectiveBpm = bpm > 0 ? bpm : 120;
-    const introDurationSec = (INTRO_BEATS * 60) / effectiveBpm;
-    const totalRapSec = Math.max(1, settings.duration);
+    const introDurationSec = (introBeats * 60) / effectiveBpm + bar1Offset;
+    const totalRapSec = Math.max(1, targetRapSeconds);
     const startedWallMs = performance.now();
 
     let raf = null;
@@ -197,7 +261,7 @@ export default function FreestyleScreen({
     return () => {
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [phase, bpm, settings.duration, player.audio, t]);
+  }, [phase, effectiveBpm, introBeats, bar1Offset, targetRapSeconds, player.audio, t]);
 
   /* ----------------------------------------------------------- handlers */
 
@@ -205,12 +269,15 @@ export default function FreestyleScreen({
     if (finishedRef.current) return;
     finishedRef.current = false;
     wordLogRef.current = [];
+    tuRoiMapRef.current.clear();
     rapStartAudioSecRef.current = null;
+    speechOkRef.current = isSpeechRecognitionSupported();
     setWordsShown(0);
     setWordsHit(0);
     setWordsMissed(0);
     setHitsOnBeat(0);
     setStreak(0);
+    setActivePlayer(1);
 
     let effectivePractice = Boolean(unsupported || practiceMode);
     if (!effectivePractice && recorderState !== 'recording') {
@@ -221,8 +288,6 @@ export default function FreestyleScreen({
       }
     }
 
-    // Start the Web Audio beat immediately at Beat 0 so the 16-beat musical
-    // intro plays locked to the real groove!
     if (beat?.src) {
       await play(beat.src, { fromStart: true });
       toggleLoop(true);
@@ -243,9 +308,7 @@ export default function FreestyleScreen({
 
   const handleStopEarly = useCallback(() => {
     const audioElapsed = player.audio?.elapsedTime ?? 0;
-    const effectiveBpm = bpm > 0 ? bpm : 120;
-    const introSec = (INTRO_BEATS * 60) / effectiveBpm;
-    // Quitting during the 16-beat intro returns cleanly to beat select.
+    const introSec = (introBeats * 60) / effectiveBpm + bar1Offset;
     if (audioElapsed < introSec && wordsShown === 0) {
       pause();
       resetRecorder();
@@ -253,14 +316,25 @@ export default function FreestyleScreen({
       return;
     }
     finishSessionRef.current(false);
-  }, [bpm, onExit, pause, player.audio, resetRecorder, wordsShown]);
+  }, [bar1Offset, effectiveBpm, introBeats, onExit, pause, player.audio, resetRecorder, wordsShown]);
 
   const handleIntroComplete = useCallback(() => {
     rapStartAudioSecRef.current = player.audio?.elapsedTime ?? 0;
   }, [player.audio]);
 
-  const handleWordShown = useCallback(() => {
+  const handleWordShown = useCallback((wordText, entry) => {
     setWordsShown((n) => n + 1);
+    if (entry && !tuRoiMapRef.current.has(entry.id)) {
+      tuRoiMapRef.current.set(entry.id, {
+        id: entry.id,
+        order: entry.order,
+        text: entry.text,
+        nest: entry.nest || '',
+        status: entry.hit ? 'hit' : 'miss',
+        heardText: entry.heardText || '',
+        playerIndex: entry.playerIndex ?? 1,
+      });
+    }
   }, []);
 
   const handleWordHit = useCallback((wordText, timing) => {
@@ -270,14 +344,42 @@ export default function FreestyleScreen({
     wordLogRef.current.push({
       text: wordText,
       status: timing?.onBeat ? 'perfect' : 'good',
+      playerIndex: timing?.wordEntry?.playerIndex ?? 1,
     });
+    const entry = timing?.wordEntry;
+    if (entry) {
+      tuRoiMapRef.current.set(entry.id, {
+        id: entry.id,
+        order: entry.order,
+        text: entry.text,
+        nest: entry.nest || '',
+        status: 'hit',
+        heardText: timing.heardText || wordText,
+        playerIndex: entry.playerIndex ?? 1,
+      });
+    }
   }, []);
 
-  const handleWordMissed = useCallback((wordText) => {
+  const handleWordMissed = useCallback((wordText, entry) => {
     setWordsMissed((n) => n + 1);
     setStreak(0);
     if (wordText) {
-      wordLogRef.current.push({ text: wordText, status: 'miss' });
+      wordLogRef.current.push({
+        text: wordText,
+        status: 'miss',
+        playerIndex: entry?.playerIndex ?? 1,
+      });
+    }
+    if (entry && !tuRoiMapRef.current.has(entry.id)) {
+      tuRoiMapRef.current.set(entry.id, {
+        id: entry.id,
+        order: entry.order,
+        text: entry.text,
+        nest: entry.nest || '',
+        status: 'miss',
+        heardText: '',
+        playerIndex: entry.playerIndex ?? 1,
+      });
     }
   }, []);
 
@@ -285,14 +387,30 @@ export default function FreestyleScreen({
     setBurstKey((k) => k + 1);
   }, []);
 
+  const handleSpeechStatusChange = useCallback((status) => {
+    if (status === 'unsupported' || status === 'denied') {
+      speechOkRef.current = false;
+    } else if (status === 'listening') {
+      speechOkRef.current = true;
+    }
+  }, []);
+
   /* -------------------------------------------------------------- render */
 
   const liveStage = phase === 'running';
-  const stageName = settings.handle
-    ? settings.battleMode && settings.opponent
-      ? `@${settings.handle} vs @${settings.opponent}`
-      : `@${settings.handle}`
-    : (beat?.title ?? t('freestyle.titleAccent'));
+  const activeHandle = settings.battleMode
+    ? activePlayer === 1
+      ? player1Handle
+      : player2Handle
+    : player1Handle;
+
+  const stageName = liveStage
+    ? `@${activeHandle}`
+    : settings.handle
+      ? settings.battleMode && settings.opponent
+        ? `@${settings.handle} vs @${settings.opponent}`
+        : `@${settings.handle}`
+      : (beat?.title ?? t('freestyle.titleAccent'));
 
   const stageContent = (
     <>
@@ -309,7 +427,7 @@ export default function FreestyleScreen({
       {/* Floating REC / PRACTICE left & ✕ stop right when live */}
       {liveStage ? (
         <>
-          <div className="absolute left-4 top-4 z-20">
+          <div className="absolute left-4 top-4 z-20 flex items-center gap-2">
             {!unsupported && !practiceMode ? (
               <span className="inline-flex items-center gap-2 rounded-full border border-danger/55 bg-danger/15 px-3 py-1 text-[11px] font-bold uppercase tracking-widest text-danger backdrop-blur-md">
                 <span className="animate-rec-pulse h-2 w-2 rounded-full bg-danger" />
@@ -320,6 +438,12 @@ export default function FreestyleScreen({
                 🎧 {t('stage.practiceBadge')}
               </span>
             )}
+
+            {settings.battleMode ? (
+              <span className="rounded-full border border-secondary/50 bg-secondary/15 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-wider text-content backdrop-blur-md">
+                ⚔️ P{activePlayer}
+              </span>
+            ) : null}
           </div>
 
           <button
@@ -363,7 +487,7 @@ export default function FreestyleScreen({
           bpm={bpm}
           active={liveStage && player.isPlaying}
           name={stageName}
-          handle={settings.handle ?? ''}
+          handle={activeHandle}
           hits={wordsHit}
           shown={wordsShown}
           streak={streak}
@@ -371,9 +495,17 @@ export default function FreestyleScreen({
 
         <WordGenerator
           running={liveStage}
-          intervalMs={settings.wordInterval * 1000}
-          mode={settings.wordMode}
+          intervalMs={(settings.wordInterval ?? 4) * 1000}
+          mode={settings.wordMode ?? 'random'}
           burnMode={settings.burnMode}
+          bars={roundBars}
+          difficulty={settings.difficulty ?? 'easy'}
+          flow={settings.flow ?? 'beat4'}
+          countIn={countInEnabled}
+          battleMode={Boolean(settings.battleMode)}
+          player1Name={`@${player1Handle}`}
+          player2Name={`@${player2Handle}`}
+          bar1Offset={bar1Offset}
           audio={player.audio}
           bpm={beat?.bpm ?? 0}
           onWordShown={handleWordShown}
@@ -381,15 +513,17 @@ export default function FreestyleScreen({
           onWordMissed={handleWordMissed}
           onStageBurst={handleStageBurst}
           onIntroComplete={handleIntroComplete}
+          onActivePlayerChange={setActivePlayer}
+          onSpeechStatusChange={handleSpeechStatusChange}
         />
 
-        {/* Bottom sunset progress bar (100% rAF GPU scaleX — zero setInterval) */}
+        {/* Bottom sunset progress bar */}
         <div className="w-full px-4 pb-2 pt-2">
           <div
             ref={progressBarRef}
             role="progressbar"
             aria-valuemin={0}
-            aria-valuemax={settings.duration}
+            aria-valuemax={Math.round(targetRapSeconds)}
             aria-valuenow={0}
             aria-label={t('freestyle.sessionProgress')}
             className="stage-rail"
@@ -405,28 +539,25 @@ export default function FreestyleScreen({
               ref={secondsLeftRef}
               className="font-mono text-[11px] tnum text-content-muted"
             >
-              {t('freestyle.secondsLeft', { n: settings.duration })}
+              {t('freestyle.secondsLeft', { n: Math.round(targetRapSeconds) })}
             </p>
             <p className="truncate text-[10px] font-semibold tracking-[0.06em] text-content-subtle">
               ♪ {beat?.title}
-              {bpm ? ` · ${bpm} BPM` : ''}
+              {bpm ? ` · ${bpm} BPM` : ''} · {roundBars} bar
             </p>
           </div>
           {liveStage ? (
             <p className="mt-4 text-center text-[10px] font-semibold uppercase tracking-[0.22em] text-content-subtle/70">
-              YOU GOT BARS?
+              VCL FREESTYLE · YOU GOT BARS?
             </p>
           ) : null}
         </div>
       </div>
 
-      {/* State-isolated floating Lyrics Pad on live stage — typing NEVER re-renders BeatEngine */}
       {liveStage ? <StageLyricsDrawer /> : null}
     </>
   );
 
-  // Full-viewport cinema stage rendered via portal so Framer Motion parent
-  // transforms can never trap `position: fixed`.
   if (liveStage) {
     const overlay = <div className="stage-fullscreen">{stageContent}</div>;
     return typeof document !== 'undefined' ? createPortal(overlay, document.body) : overlay;
@@ -477,7 +608,6 @@ export default function FreestyleScreen({
 
       <BeatPlayer beat={beat} player={player} showSeek />
 
-      {/* Isolated lyrics scratchpad — own state so typing never re-renders the beat visualizer */}
       <IsolatedLyricsPad />
 
       {!unsupported ? (
@@ -494,26 +624,28 @@ export default function FreestyleScreen({
           onRetry={prepare}
           onPractice={() => setPracticeMode(true)}
           practiceMode={practiceMode}
-          targetSeconds={settings.duration}
+          targetSeconds={Math.round(targetRapSeconds)}
         />
       ) : null}
 
       <div className="panel space-y-5 p-4">
         <SegmentedControl
-          name="session-length"
-          label={t('freestyle.sessionLength')}
-          value={settings.duration}
-          onChange={(value) => onSettingsChange({ ...settings, duration: value })}
-          options={[30, 60, 90].map((seconds) => ({
-            value: seconds,
-            label: `${seconds}s`,
-          }))}
+          name="session-bars"
+          label={t('setup.barsLabel')}
+          value={settings.bars ?? 16}
+          onChange={(value) => onSettingsChange({ ...settings, bars: value })}
+          options={[
+            { value: 8, label: '8 bar' },
+            { value: 16, label: '16 bar' },
+            { value: 32, label: '32 bar' },
+            { value: 'full', label: t('setup.fullTrack') },
+          ]}
         />
 
         <SliderField
           id="word-interval"
           label={t('freestyle.wordInterval')}
-          value={settings.wordInterval}
+          value={settings.wordInterval ?? 4}
           min={2}
           max={10}
           step={1}
@@ -522,22 +654,11 @@ export default function FreestyleScreen({
           note={
             bpm
               ? t('freestyle.beatsCount', {
-                  n: snapToBarBeats(settings.wordInterval, bpm),
+                  n: snapToBarBeats(settings.wordInterval ?? 4, bpm),
                 })
               : null
           }
           hint={t('freestyle.wordIntervalHint')}
-        />
-
-        <SegmentedControl
-          name="word-mode"
-          label={t('freestyle.wordOrder')}
-          value={settings.wordMode}
-          onChange={(value) => onSettingsChange({ ...settings, wordMode: value })}
-          options={[
-            { value: 'random', label: t('freestyle.random') },
-            { value: 'sequential', label: t('freestyle.sequential') },
-          ]}
         />
 
         <div className="flex items-center justify-between gap-4">
@@ -564,11 +685,6 @@ export default function FreestyleScreen({
   );
 }
 
-/**
- * Isolated floating Lyrics Drawer on the live stage.
- * Owns both its open/closed state and typed text state so typing bars
- * continuously never triggers any re-render of the BeatEngine or stage.
- */
 const StageLyricsDrawer = memo(function StageLyricsDrawer() {
   const t = useT();
   const [open, setOpen] = useState(false);
@@ -625,9 +741,6 @@ const StageLyricsDrawer = memo(function StageLyricsDrawer() {
   );
 });
 
-/**
- * Isolated bars/lyrics scratchpad for setup mode.
- */
 const IsolatedLyricsPad = memo(function IsolatedLyricsPad() {
   const t = useT();
   const [notes, setNotes] = useState('');

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'framer-motion';
 import AppShell from './components/AppShell';
+import AuthModal from './components/AuthModal';
+import BeatUploadModal from './components/BeatUploadModal';
 import YourBeatBar from './components/YourBeatBar';
 import LandingScreen from './screens/LandingScreen';
 import BeatSelectScreen from './screens/BeatSelectScreen';
@@ -8,41 +10,77 @@ import SetupScreen from './screens/SetupScreen';
 import FreestyleScreen from './screens/FreestyleScreen';
 import ResultsScreen from './screens/ResultsScreen';
 import StatsScreen from './screens/StatsScreen';
+import VoteScreen from './screens/VoteScreen';
 import { BEATS, beatText } from './data/beats';
 import { useAudioPlayer } from './hooks/useAudioPlayer';
 import { useMediaRecorder } from './hooks/useMediaRecorder';
 import { useLanguage, useT } from './i18n/LanguageContext';
+import { deleteCustomBeat, loadCustomBeats } from './lib/customBeats';
 import { clearRuns, loadRuns, saveRun } from './lib/history';
 import { SPRING_BOUNCY, screenVariants } from './lib/motion';
 import { computeHypeScore, decodeSharePayload } from './lib/scoring';
 import { describeUnsupported } from './lib/permissions';
+import { loadPublicRhymeBank } from './lib/rhymeEngine';
+import { ensureDemoSeeded, getCurrentUser } from './lib/vclStore';
 
 const DEFAULT_SETTINGS = {
   duration: 60,
+  bars: 16, // 8 | 16 (default) | 32 | 'full'
+  difficulty: 'easy', // 'easy' (Dễ) | 'medium' (Vừa) | 'hard' (Khó)
+  flow: 'beat4', // 'beat4' (Phách 4) | 'beat24' (Phách 2 & 4)
+  countIn: true, // Bật (4 bar) | Tắt
   wordInterval: 4,
-  wordMode: 'random', // random | sequential
+  wordMode: 'random',
   burnMode: false,
-  video: false,
+  video: true,
   practice: false,
   battleMode: false,
   handle: '',
   opponent: '',
 };
 
+/** Parses `/cham/<code>` or `#cham/<code>?u=<viewerId>&src=<source>` from window.location. */
+function parseVoteRouteFromWindow() {
+  if (typeof window === 'undefined') return null;
+  const hash = window.location.hash || '';
+  const path = window.location.pathname || '';
+
+  let raw = '';
+  if (hash.startsWith('#cham/')) {
+    raw = hash.slice('#cham/'.length);
+  } else if (path.startsWith('/cham/')) {
+    raw = path.slice('/cham/'.length) + (window.location.search || '');
+  }
+  if (!raw) return null;
+
+  const [codePart, queryPart = ''] = raw.split('?');
+  const code = decodeURIComponent(codePart || '').replace(/\/+$/, '');
+  if (!code) return null;
+  const params = new URLSearchParams(queryPart);
+  return {
+    code,
+    viewerId: params.get('u') || '',
+    source: params.get('src') || (params.get('u') ? 'social' : 'web'),
+  };
+}
+
 /**
  * The single-page state machine.
- *
- * Wrapped in `<MotionConfig reducedMotion="user">` so every Framer Motion
- * spring automatically respects `prefers-reduced-motion`.
  */
 export default function App() {
   const [screen, setScreen] = useState('landing');
+  const [customBeats, setCustomBeats] = useState([]);
   const [selectedBeat, setSelectedBeat] = useState(null);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [result, setResult] = useState(null);
   const [runs, setRuns] = useState([]);
   const [autoStartStage, setAutoStartStage] = useState(false);
   const [toast, setToast] = useState(null);
+  const [user, setUser] = useState(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [uploadModalOpen, setUploadModalOpen] = useState(false);
+  const [voteRoute, setVoteRoute] = useState(null); // { code, viewerId, source }
+  const [dataVersion, setDataVersion] = useState(0);
   const toastTimerRef = useRef(null);
 
   const player = useAudioPlayer();
@@ -52,6 +90,7 @@ export default function App() {
   const t = useT();
 
   const unsupported = useMemo(() => describeUnsupported(), []);
+  const allBeats = useMemo(() => [...customBeats, ...BEATS], [customBeats]);
 
   const showToast = useCallback((message) => {
     if (!message) return;
@@ -60,60 +99,101 @@ export default function App() {
     toastTimerRef.current = setTimeout(() => setToast(null), 2600);
   }, []);
 
+  // Hydrate demo auth, public rhyme bank, custom beats (IndexedDB), local runs, and hash/path routes.
   useEffect(() => {
+    ensureDemoSeeded();
+    loadPublicRhymeBank();
+    const current = getCurrentUser();
+    setUser(current);
+    if (current?.socialHandle) {
+      setSettings((prev) => (prev.handle ? prev : { ...prev, handle: current.socialHandle }));
+    }
     setRuns(loadRuns());
+    loadCustomBeats().then((loaded) => {
+      if (loaded.length > 0) setCustomBeats(loaded);
+    });
+
+    const syncRoute = () => {
+      const vote = parseVoteRouteFromWindow();
+      if (vote) {
+        setVoteRoute(vote);
+        setScreen('vote');
+        return;
+      }
+
+      const hash = window.location.hash;
+      if (hash.startsWith('#result=')) {
+        const payload = decodeSharePayload(hash.slice('#result='.length));
+        if (payload && typeof payload.s === 'number') {
+          setResult({
+            score: Math.max(0, Math.min(100, payload.s)),
+            durationSeconds: payload.d ?? 0,
+            targetSeconds: payload.d ?? 0,
+            wordsShown: payload.t ?? 0,
+            wordsHit: payload.w ?? 0,
+            perfectHits: payload.p ?? 0,
+            wordsMissed: 0,
+            wordLog: [],
+            completed: Boolean(payload.c),
+            practiceMode: false,
+            blob: null,
+            video: false,
+            beatId: payload.b || null,
+            beatTitle: null,
+            mediaType: '',
+          });
+          setScreen('results');
+        }
+      }
+    };
+
+    syncRoute();
+    window.addEventListener('hashchange', syncRoute);
     return () => {
+      window.removeEventListener('hashchange', syncRoute);
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     };
   }, []);
 
-  /* -------------------------------------------- shared results from a link */
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const hash = window.location.hash;
-    if (!hash.startsWith('#result=')) return;
-
-    const payload = decodeSharePayload(hash.slice('#result='.length));
-    if (!payload || typeof payload.s !== 'number') return;
-
-    setResult({
-      score: Math.max(0, Math.min(100, payload.s)),
-      durationSeconds: payload.d ?? 0,
-      targetSeconds: payload.d ?? 0,
-      wordsShown: payload.t ?? 0,
-      wordsHit: payload.w ?? 0,
-      perfectHits: payload.p ?? 0,
-      wordsMissed: 0,
-      wordLog: [],
-      completed: Boolean(payload.c),
-      practiceMode: false,
-      blob: null,
-      video: false,
-      beatId: payload.b || null,
-      beatTitle: null,
-      mediaType: '',
-    });
-    setScreen('results');
-  }, []);
-
   /* ----------------------------------------------------------- navigation */
+
+  const clearHashIfVote = () => {
+    if (typeof window !== 'undefined' && window.location.hash.startsWith('#cham/')) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+  };
 
   const goToLanding = useCallback(() => {
     player.pause();
+    clearHashIfVote();
     setAutoStartStage(false);
     setScreen('landing');
   }, [player]);
 
   const goToSetup = useCallback(() => {
     player.pause();
+    clearHashIfVote();
     setScreen('setup');
   }, [player]);
 
   const goToStats = useCallback(() => {
     player.pause();
+    clearHashIfVote();
+    setDataVersion((v) => v + 1);
     setScreen('stats');
   }, [player]);
+
+  const openVotePage = useCallback(
+    (code, viewerId = '') => {
+      player.pause();
+      setVoteRoute({ code, viewerId, source: 'web' });
+      if (typeof window !== 'undefined') {
+        window.history.replaceState(null, '', `${window.location.pathname}#cham/${code}`);
+      }
+      setScreen('vote');
+    },
+    [player],
+  );
 
   const handleSelectBeat = useCallback((beat) => {
     setSelectedBeat(beat);
@@ -123,19 +203,52 @@ export default function App() {
     setSelectedBeat(null);
   }, []);
 
+  const handleBeatUploaded = useCallback(
+    (newBeat) => {
+      setCustomBeats((prev) => [newBeat, ...prev]);
+      setSelectedBeat(newBeat);
+      showToast(t('upload.toastAdded', { title: newBeat.title }));
+    },
+    [showToast, t],
+  );
+
+  const handleDeleteCustomBeat = useCallback(
+    async (beatId) => {
+      await deleteCustomBeat(beatId);
+      setCustomBeats((prev) => prev.filter((b) => b.id !== beatId));
+      setSelectedBeat((prev) => (prev?.id === beatId ? null : prev));
+      showToast(t('upload.toastDeleted'));
+    },
+    [showToast, t],
+  );
+
+  const handleAuthChange = useCallback(
+    (nextUser) => {
+      setUser(nextUser);
+      setDataVersion((v) => v + 1);
+      if (nextUser) {
+        setSettings((prev) => ({ ...prev, handle: nextUser.socialHandle }));
+        showToast(t('auth.welcomeToast', { name: nextUser.displayName }));
+      } else {
+        showToast(t('auth.logoutToast'));
+      }
+    },
+    [showToast, t],
+  );
+
   const launchFreestyle = useCallback(
     (auto = true) => {
       player.pause();
       let armed = selectedBeat;
       if (!armed) {
-        armed = BEATS[Math.floor(Math.random() * BEATS.length)];
+        armed = allBeats[Math.floor(Math.random() * allBeats.length)];
         setSelectedBeat(armed);
         showToast(t('toast.randomPicked', { title: armed.title }));
       }
       setAutoStartStage(auto);
       setScreen('freestyle');
     },
-    [player, selectedBeat, showToast, t],
+    [allBeats, player, selectedBeat, showToast, t],
   );
 
   const handleComplete = useCallback(
@@ -204,10 +317,11 @@ export default function App() {
   const modeSummary =
     unsupported || settings.practice
       ? `🎧 ${t('setup.modePractice')}`
-      : `🎤 ${t('setup.modeRecord')}`;
+      : `🏆 ${t('setup.modeCompete')}`;
+  const barsSummary = settings.bars === 'full' ? t('setup.fullTrack') : `${settings.bars ?? 16} bar`;
   const dockSubtitle = isRandom
-    ? `${modeSummary} · ${settings.duration}s`
-    : `${armedBeat.bpm} BPM · ${beatText(armedBeat, 'mood', locale)}`;
+    ? `${modeSummary} · ${barsSummary}`
+    : `${armedBeat.bpm} BPM · ${barsSummary} · ${beatText(armedBeat, 'mood', locale)}`;
 
   const showDock = screen === 'landing' || screen === 'setup' || screen === 'beatSelect';
 
@@ -224,7 +338,7 @@ export default function App() {
           }}
         />
 
-        {/* Spring-animated floating Toast (GPU transform + opacity only) */}
+        {/* Spring-animated floating Toast */}
         <AnimatePresence>
           {toast ? (
             <motion.div
@@ -247,7 +361,9 @@ export default function App() {
             screen={screen}
             runCount={runs.length}
             onNavigate={handleNavigate}
-            beatCount={BEATS.length}
+            beatCount={allBeats.length}
+            user={user}
+            onOpenAuth={() => setAuthModalOpen(true)}
             footer={
               showDock ? (
                 <YourBeatBar
@@ -278,9 +394,11 @@ export default function App() {
                   <LandingScreen
                     onStart={() => launchFreestyle(true)}
                     onOpenBeats={goToLanding}
-                    beatCount={BEATS.length}
+                    onOpenUpload={() => setUploadModalOpen(true)}
+                    onDeleteCustomBeat={handleDeleteCustomBeat}
+                    beatCount={allBeats.length}
                     supported={!unsupported}
-                    beats={BEATS}
+                    beats={allBeats}
                     player={player}
                     selectedBeat={selectedBeat}
                     onSelect={handleSelectBeat}
@@ -290,7 +408,7 @@ export default function App() {
 
                 {screen === 'beatSelect' ? (
                   <BeatSelectScreen
-                    beats={BEATS}
+                    beats={allBeats}
                     player={player}
                     selectedBeat={selectedBeat}
                     onSelect={handleSelectBeat}
@@ -307,6 +425,7 @@ export default function App() {
                     onSettingsChange={setSettings}
                     onBack={goToLanding}
                     unsupported={unsupported}
+                    user={user}
                   />
                 ) : null}
 
@@ -321,12 +440,21 @@ export default function App() {
                     onExit={goToLanding}
                     unsupported={unsupported}
                     autoStart={autoStartStage}
+                    user={user}
                   />
                 ) : null}
 
                 {screen === 'results' && result ? (
                   <ResultsScreen
                     result={result}
+                    user={user}
+                    onOpenAuth={() => setAuthModalOpen(true)}
+                    onOpenVote={(code) => openVotePage(code)}
+                    onSubmitted={() => {
+                      setUser(getCurrentUser());
+                      setDataVersion((v) => v + 1);
+                      showToast(t('submit.toastSubmitted'));
+                    }}
                     onRestart={handleRestart}
                     onChangeBeat={handleChangeBeat}
                     onHome={goToLanding}
@@ -336,14 +464,47 @@ export default function App() {
                 {screen === 'stats' ? (
                   <StatsScreen
                     runs={runs}
+                    dataVersion={dataVersion}
+                    onOpenVote={(code) => openVotePage(code)}
                     onBack={goToLanding}
                     onReset={handleResetStats}
+                  />
+                ) : null}
+
+                {screen === 'vote' && voteRoute ? (
+                  <VoteScreen
+                    voteCode={voteRoute.code}
+                    viewerIdParam={voteRoute.viewerId}
+                    sourceParam={voteRoute.source}
+                    user={user}
+                    player={player}
+                    extraBeats={customBeats}
+                    onBack={goToStats}
+                    onDataChanged={() => {
+                      setUser(getCurrentUser());
+                      setDataVersion((v) => v + 1);
+                    }}
                   />
                 ) : null}
               </motion.div>
             </AnimatePresence>
           </AppShell>
         </div>
+
+        {/* Demo Auth Modal */}
+        <AuthModal
+          open={authModalOpen}
+          user={user}
+          onClose={() => setAuthModalOpen(false)}
+          onAuthChange={handleAuthChange}
+        />
+
+        {/* Custom Audio Beat Upload Modal */}
+        <BeatUploadModal
+          open={uploadModalOpen}
+          onClose={() => setUploadModalOpen(false)}
+          onUploaded={handleBeatUploaded}
+        />
       </div>
     </MotionConfig>
   );

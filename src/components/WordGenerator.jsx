@@ -1,31 +1,24 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
 import IntroCountdownOverlay from './IntroCountdownOverlay';
 import TargetExplosion from './TargetExplosion';
 import WordCarousel from './WordCarousel';
 import WordPop from './WordPop';
-import { DEFAULT_WORD, WORD_BANK, sequentialWords } from '../data/words';
+import { DEFAULT_WORD } from '../data/words';
 import { useLanguage } from '../i18n/LanguageContext';
 import {
   TIMING,
   judgeOffset,
   offsetFromNearestBeat,
-  snapToBarBeats,
 } from '../lib/beatGrid';
+import { generateRoundWordPlan } from '../lib/rhymeEngine';
+import { createSpeechTracker, doesTranscriptMatchWord } from '../lib/speechMatcher';
+import { SPRING_BOUNCY } from '../lib/motion';
 
 /**
- * Total opening beats before the first word hits the target zone & explodes:
- *  - Beats 0..11: 3 rounds of "1 - 2 - 3 - 4" (1/3, 2/3, 3/3)
- *  - Beats 12..15: "3 - 2 - 1 - GO!"
- *  - Beat 16: First word reaches the hit zone, explodes, and unmounts!
+ * Total opening beats when Count-in is enabled (4 bars = 16 beats).
  */
 export const INTRO_BEATS = 16;
-
-const QUEUE_LENGTH = 4;
-
-/** Paired rhythm color alternation (lime, orange, orange, lime, lime...) */
-function toneForIndex(seq) {
-  return Math.floor((seq + 1) / 2) % 2 === 0 ? 'lime' : 'orange';
-}
 
 const IDLE_PREVIEW_WORD = {
   id: 'idle-0',
@@ -35,23 +28,30 @@ const IDLE_PREVIEW_WORD = {
 };
 
 /**
- * Beat-Locked Word Engine (Hit Zone -> Explode -> Complete Unmount).
+ * Beat-Locked VCL Rhyme Engine + Live Vietnamese Speech Recognizer + Battle Turn Cues.
  *
- * Uses a single `requestAnimationFrame` loop computing:
- *   `currentBeat = (audioTime * bpm) / 60`
- * (zero `setInterval`):
- *  - Each word approaches over 2–4 beats before its `hitBeat` (16, 20, 24...).
- *  - The instant `currentBeat >= word.hitBeat`, the word is removed from the
- *    active highway and passed to `<TargetExplosion>` (Framer Motion
- *    `AnimatePresence`) which bursts it (`scale: 1 -> 1.76`, opacity flash,
- *    shockwave rings, 16 radial particles) over ~310ms and unmounts it
- *    completely from the DOM — never holding it inside the hit zone!
+ * Implements Spec Sections 2, 3, and 6:
+ *  - Draws words from Kho vần VCL v0 (OK only, matching difficulty, paired 2 bars
+ *    per rhyme nest, no duplicate final syllables in a pair, no repeats in a round).
+ *  - Drops on Beat 4 (flow = 'beat4') or Beats 2 & 4 (flow = 'beat24').
+ *  - Shows upcoming words dimmed 1 bar early and lights them up / explodes at target beat.
+ *  - Listens via Web Speech API (vi-VN / en-US) and scores a hit whenever the player
+ *    speaks the target word within [hitBeat - 1, hitBeat + 1] (plus manual tap/Space fallback).
+ *  - In Battle mode: alternates every 2 bars and shows "Đến lượt @tên" 1 bar before switch.
  */
 const WordGenerator = memo(function WordGenerator({
   running,
-  intervalMs,
-  mode, // 'random' | 'sequential'
-  burnMode,
+  intervalMs = 4000,
+  mode = 'random',
+  burnMode = false,
+  bars = 16,
+  difficulty = 'easy',
+  flow = 'beat4',
+  countIn = true,
+  battleMode = false,
+  player1Name = 'Player 1',
+  player2Name = 'Player 2',
+  bar1Offset = 0,
   audio = null,
   bpm = 0,
   onWordShown,
@@ -59,23 +59,33 @@ const WordGenerator = memo(function WordGenerator({
   onWordMissed,
   onStageBurst,
   onIntroComplete,
+  onActivePlayerChange,
+  onSpeechStatusChange,
 }) {
   const { locale, t } = useLanguage();
   const [upcoming, setUpcoming] = useState([]);
-  const [introBeat, setIntroBeat] = useState(null); // 0..15 during intro, null after
-  const [bursts, setBursts] = useState([]); // [{ id, text, tone }] — auto-unmounted after ~320ms
+  const [introBeat, setIntroBeat] = useState(null);
+  const [bursts, setBursts] = useState([]);
   const [pop, setPop] = useState(null);
   const [flash, setFlash] = useState(null);
   const [sweepKey, setSweepKey] = useState(0);
+  const [currentNest, setCurrentNest] = useState('');
+  const [speechStatus, setSpeechStatus] = useState('idle'); // idle | listening | unsupported | denied | error
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const [turnBanner, setTurnBanner] = useState(null); // string | null
 
-  // Track the currently hittable word (approaching head or within brief post-impact grace).
-  const lastJudgedRef = useRef(null); // { id, text, hitBeat, hit }
-  const indexRef = useRef(0);
-  const idRef = useRef(0);
-  const nextHitBeatRef = useRef(INTRO_BEATS);
+  const introBeats = countIn ? INTRO_BEATS : 0;
+  const effectiveBpm = bpm > 0 ? bpm : 120;
+  const intervalBeats = flow === 'beat24' ? 2 : 4;
+
+  const planRef = useRef([]); // full pre-generated round plan
+  const cursorRef = useRef(0); // next unexploded index in planRef
   const explodedIdsRef = useRef(new Set());
+  const pendingMissChecksRef = useRef([]); // exploded words waiting for +1 beat window to close
   const introDoneRef = useRef(false);
   const lastIntroBeatRef = useRef(-1);
+  const lastActivePlayerRef = useRef(1);
+  const lastTurnBannerRef = useRef(null);
 
   const frontCardRef = useRef(null);
   const logoRef = useRef(null);
@@ -91,62 +101,54 @@ const WordGenerator = memo(function WordGenerator({
     audioTime: 0,
   });
 
-  const effectiveBpm = bpm > 0 ? bpm : 120;
-  // Lock word intervals to whole 4/4 bars (4, 8, 12... beats) so every word
-  // explodes dead-on Beat 1 (the heavy kick downbeat) of the bar!
-  const intervalBeats = snapToBarBeats(intervalMs / 1000, effectiveBpm);
-
   const onWordShownRef = useRef(onWordShown);
   onWordShownRef.current = onWordShown;
+  const onWordHitRef = useRef(onWordHit);
+  onWordHitRef.current = onWordHit;
   const onWordMissedRef = useRef(onWordMissed);
   onWordMissedRef.current = onWordMissed;
   const onStageBurstRef = useRef(onStageBurst);
   onStageBurstRef.current = onStageBurst;
   const onIntroCompleteRef = useRef(onIntroComplete);
   onIntroCompleteRef.current = onIntroComplete;
+  const onActivePlayerChangeRef = useRef(onActivePlayerChange);
+  onActivePlayerChangeRef.current = onActivePlayerChange;
+  const onSpeechStatusChangeRef = useRef(onSpeechStatusChange);
+  onSpeechStatusChangeRef.current = onSpeechStatusChange;
 
-  const drawWord = useCallback(() => {
-    let text;
-    if (mode === 'sequential') {
-      const bank = sequentialWords(locale);
-      text = bank[indexRef.current % bank.length];
-      indexRef.current += 1;
-    } else {
-      const bank = WORD_BANK[locale] ?? WORD_BANK.en;
-      text = bank[Math.floor(Math.random() * bank.length)];
+  const syncVisibleQueue = useCallback(() => {
+    const slice = planRef.current.slice(cursorRef.current, cursorRef.current + 4);
+    queueRef.current = slice;
+    setUpcoming(slice);
+    if (slice[0]?.nest) {
+      setCurrentNest(slice[0].nest);
     }
-    const seq = idRef.current++;
-    const hitBeat = nextHitBeatRef.current;
-    nextHitBeatRef.current += intervalBeats;
-    return {
-      id: `w-${seq}`,
-      text,
-      tone: toneForIndex(seq),
-      hitBeat,
-      hit: false,
-    };
-  }, [mode, locale, intervalBeats]);
+  }, []);
 
-  const fillQueue = useCallback(() => {
-    while (queueRef.current.length < QUEUE_LENGTH) {
-      queueRef.current.push(drawWord());
-    }
-    setUpcoming([...queueRef.current]);
-  }, [drawWord]);
-
-  // Reset & pre-populate queue when run starts or word settings change.
+  // Generate fresh VCL rhyme plan whenever run starts or round settings change.
   useEffect(() => {
-    indexRef.current = 0;
-    idRef.current = 0;
-    nextHitBeatRef.current = INTRO_BEATS;
+    const freshPlan = generateRoundWordPlan({
+      barCount: bars,
+      difficulty,
+      flow,
+      locale,
+      introBeats,
+      battleMode,
+    });
+
+    planRef.current = freshPlan;
+    cursorRef.current = 0;
     explodedIdsRef.current.clear();
-    introDoneRef.current = false;
+    pendingMissChecksRef.current = [];
+    introDoneRef.current = introBeats === 0;
     lastIntroBeatRef.current = -1;
-    lastJudgedRef.current = null;
-    queueRef.current = [];
+    lastActivePlayerRef.current = 1;
+    lastTurnBannerRef.current = null;
     setFlash(null);
     setPop(null);
     setBursts([]);
+    setLiveTranscript('');
+    setTurnBanner(null);
     beatClockRef.current = {
       currentBeat: 0,
       beatIndex: 0,
@@ -156,44 +158,114 @@ const WordGenerator = memo(function WordGenerator({
     };
 
     if (running) {
-      setIntroBeat(0);
+      setIntroBeat(introBeats > 0 ? 0 : null);
+      if (introBeats === 0) {
+        onIntroCompleteRef.current?.();
+      }
     } else {
       setIntroBeat(null);
     }
-    fillQueue();
-  }, [running, mode, locale, fillQueue]);
 
-  // Remove burst entry from state once its ~310ms explosion finishes so
-  // `<AnimatePresence>` unmounts it cleanly from the DOM.
+    syncVisibleQueue();
+  }, [running, bars, difficulty, flow, locale, introBeats, battleMode, mode, syncVisibleQueue]);
+
   const handleBurstDone = useCallback((burstId) => {
     setBursts((prev) => prev.filter((item) => item.id !== burstId));
   }, []);
 
-  // Explode the arriving word STRICTLY ONCE when `currentBeat >= word.hitBeat`,
-  // removing it from the highway immediately so it explodes & unmounts cleanly!
+  // Mark a target word as hit (either by Web Speech API or manual Space/click)
+  const markWordAsHit = useCallback(
+    (target, { heardText = '', viaSpeech = false } = {}) => {
+      if (!target || target.hit) return;
+      target.hit = true;
+      target.heardText = heardText || target.text;
+
+      let judgement = TIMING.PERFECT;
+      let offsetMs = 0;
+      if (!viaSpeech && effectiveBpm) {
+        offsetMs = offsetFromNearestBeat(beatClockRef.current.audioTime, effectiveBpm);
+        judgement = judgeOffset(offsetMs);
+      }
+
+      let origin = { x: 0, y: 0 };
+      const anchorEl = targetBoxRef.current || frontCardRef.current;
+      if (anchorEl) {
+        const rect = anchorEl.getBoundingClientRect();
+        origin = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      }
+
+      if (viaSpeech || judgement === TIMING.PERFECT || judgement === TIMING.GOOD) {
+        setPop({
+          ...origin,
+          strength: viaSpeech ? TIMING.PERFECT : judgement,
+          key: `${Date.now()}-${target.id}`,
+        });
+        setFlash(viaSpeech ? TIMING.PERFECT : judgement);
+        onStageBurstRef.current?.();
+      } else {
+        setFlash('miss');
+      }
+
+      onWordHitRef.current?.(target.text, {
+        onBeat: viaSpeech || judgement === TIMING.PERFECT,
+        offsetMs,
+        judgement: viaSpeech ? TIMING.PERFECT : judgement,
+        heardText: target.heardText,
+        wordEntry: target,
+      });
+    },
+    [effectiveBpm],
+  );
+
+  // Web Speech API tracker (runs only while live stage is active)
+  useEffect(() => {
+    if (!running || typeof window === 'undefined') {
+      setSpeechStatus('idle');
+      return undefined;
+    }
+
+    const lang = locale === 'vi' ? 'vi-VN' : 'en-US';
+    const tracker = createSpeechTracker({
+      lang,
+      onStatusChange: (status) => {
+        setSpeechStatus(status);
+        onSpeechStatusChangeRef.current?.(status);
+      },
+      onTranscript: (text) => {
+        setLiveTranscript(text.slice(-48));
+        const currentBeat = beatClockRef.current.currentBeat;
+
+        // Spec Section 3: Match any unhit word within [hitBeat - 1, hitBeat + 1]
+        for (const candidate of planRef.current) {
+          if (candidate.hit) continue;
+          if (currentBeat >= candidate.hitBeat - 1.1 && currentBeat <= candidate.hitBeat + 1.15) {
+            if (doesTranscriptMatchWord(text, candidate.text)) {
+              markWordAsHit(candidate, { heardText: text, viaSpeech: true });
+              break;
+            }
+          }
+        }
+      },
+    });
+
+    tracker.start();
+    return () => {
+      tracker.stop();
+    };
+  }, [running, locale, markWordAsHit]);
+
+  // Explode arriving word strictly once at `currentBeat >= word.hitBeat`
   const triggerWordExplosion = useCallback(
     (wordEntry) => {
       if (!wordEntry || explodedIdsRef.current.has(wordEntry.id)) return;
       explodedIdsRef.current.add(wordEntry.id);
 
-      // Flush previous word as missed if it was never hit during its window.
-      const prevJudged = lastJudgedRef.current;
-      if (prevJudged && !prevJudged.hit) {
-        onWordMissedRef.current?.(prevJudged.text);
-      }
+      cursorRef.current += 1;
+      syncVisibleQueue();
 
-      // Remove exploded word from the queue immediately (NOT held in the box!).
-      if (queueRef.current[0]?.id === wordEntry.id) {
-        queueRef.current.shift();
-      } else {
-        queueRef.current = queueRef.current.filter((w) => w.id !== wordEntry.id);
-      }
-      fillQueue();
+      // Track for +1 beat post-target speech window before finalizing miss
+      pendingMissChecksRef.current.push(wordEntry);
 
-      // Keep a brief grace reference so hitting right on or just after hitBeat still counts.
-      lastJudgedRef.current = wordEntry;
-
-      // Spawn the one-shot Framer Motion explode-and-unmount burst right at the Hit Zone.
       setBursts((prev) => [
         ...prev.slice(-2),
         { id: wordEntry.id, text: wordEntry.text, tone: wordEntry.tone },
@@ -203,12 +275,12 @@ const WordGenerator = memo(function WordGenerator({
       setPop(null);
 
       onStageBurstRef.current?.();
-      onWordShownRef.current?.(wordEntry.text);
+      onWordShownRef.current?.(wordEntry.text, wordEntry);
     },
-    [fillQueue],
+    [syncVisibleQueue],
   );
 
-  // Master 60/120fps `requestAnimationFrame` Beat Engine (ZERO `setInterval`).
+  // Master 60/120fps rAF Beat Engine
   useEffect(() => {
     if (!running || typeof window === 'undefined') {
       if (logoRef.current) logoRef.current.style.transform = '';
@@ -223,13 +295,14 @@ const WordGenerator = memo(function WordGenerator({
     const tick = (now) => {
       raf = requestAnimationFrame(tick);
 
-      const audioTime =
+      const rawAudioTime =
         audio && typeof audio.elapsedTime === 'number'
           ? audio.elapsedTime
           : audio && typeof audio.currentTime === 'number'
             ? audio.currentTime
             : Math.max(0, (now - startedWallMs) / 1000);
 
+      const audioTime = Math.max(0, rawAudioTime - (bar1Offset || 0));
       const currentBeat = (audioTime * effectiveBpm) / 60;
       const beatIndex = Math.floor(currentBeat);
       const beatPhase = currentBeat - beatIndex;
@@ -241,14 +314,12 @@ const WordGenerator = memo(function WordGenerator({
       beatClockRef.current.beatInBar = beatInBar;
       beatClockRef.current.audioTime = audioTime;
 
-      // 1) 16-beat opening timeline:
-      //    Beats 0..11: 3x "1 - 2 - 3 - 4" (1/3, 2/3, 3/3)
-      //    Beats 12..15: "3 - 2 - 1 - GO!"
-      if (beatIndex < INTRO_BEATS) {
+      // 1) Count-in (4 bars = 16 beats when enabled)
+      if (introBeats > 0 && beatIndex < introBeats) {
         if (beatIndex !== lastIntroBeatRef.current) {
           lastIntroBeatRef.current = beatIndex;
           setIntroBeat(beatIndex);
-          if (beatIndex === 15) {
+          if (beatIndex === introBeats - 1) {
             onStageBurstRef.current?.();
           }
         }
@@ -258,16 +329,48 @@ const WordGenerator = memo(function WordGenerator({
         onIntroCompleteRef.current?.();
       }
 
-      // 2) Exact hitBeat impact check (Beat 16+):
-      //    As soon as `currentBeat >= head.hitBeat`, explode & unmount the word!
-      if (currentBeat >= INTRO_BEATS) {
-        const head = queueRef.current[0];
-        if (head && currentBeat >= head.hitBeat && !explodedIdsRef.current.has(head.id)) {
-          triggerWordExplosion(head);
+      // 2) Battle mode turn tracking (alternating every 2 bars, warning 1 bar before switch)
+      if (battleMode && currentBeat >= Math.max(0, introBeats - 4)) {
+        const rapBeat = currentBeat - introBeats;
+        const currentBar = Math.floor(rapBeat / 4);
+        if (currentBar >= 0) {
+          const activePlayer = (Math.floor(currentBar / 2) % 2) + 1;
+          if (activePlayer !== lastActivePlayerRef.current) {
+            lastActivePlayerRef.current = activePlayer;
+            onActivePlayerChangeRef.current?.(activePlayer);
+          }
+          // Spec Section 6: "1 bar trước khi đổi lượt, màn hình báo 'Đến lượt @tên'"
+          const isWarningBar = currentBar % 2 === 1 && currentBar + 1 < bars;
+          const nextPlayerName = activePlayer === 1 ? player2Name : player1Name;
+          const bannerText = isWarningBar ? nextPlayerName : null;
+          if (bannerText !== lastTurnBannerRef.current) {
+            lastTurnBannerRef.current = bannerText;
+            setTurnBanner(bannerText);
+          }
         }
       }
 
-      // 3) Direct GPU beat-bounce on Logo, 4-Corner Hit Zone, and 4 Beat Dots.
+      // 3) Trigger explosion on exact hitBeat
+      const head = queueRef.current[0];
+      if (head && currentBeat >= head.hitBeat && !explodedIdsRef.current.has(head.id)) {
+        triggerWordExplosion(head);
+      }
+
+      // 4) Finalize missed words once their +1 beat grace window passes
+      if (pendingMissChecksRef.current.length > 0) {
+        const remaining = [];
+        for (const item of pendingMissChecksRef.current) {
+          if (item.hit) continue;
+          if (currentBeat > item.hitBeat + 1.15) {
+            onWordMissedRef.current?.(item.text, item);
+          } else {
+            remaining.push(item);
+          }
+        }
+        pendingMissChecksRef.current = remaining;
+      }
+
+      // 5) GPU beat-bounce on Logo, 4-Corner Hit Zone, and 4 Beat Dots
       if (!reduced) {
         const kick = Math.pow(Math.max(0, 1 - beatPhase), 2.5);
         const downbeatBoost = beatInBar === 0 ? 1.28 : 1.0;
@@ -309,59 +412,45 @@ const WordGenerator = memo(function WordGenerator({
     raf = requestAnimationFrame(tick);
     return () => {
       if (raf) cancelAnimationFrame(raf);
+      // Flush any still-pending unhit words when stopping
+      for (const item of pendingMissChecksRef.current) {
+        if (!item.hit) onWordMissedRef.current?.(item.text, item);
+      }
+      pendingMissChecksRef.current = [];
     };
-  }, [running, audio, effectiveBpm, triggerWordExplosion]);
+  }, [
+    running,
+    audio,
+    effectiveBpm,
+    bar1Offset,
+    introBeats,
+    battleMode,
+    bars,
+    player1Name,
+    player2Name,
+    triggerWordExplosion,
+  ]);
 
-  /* ------------------------------------------------------------ the hit */
+  /* --------------------------------------------------- manual Space/tap hit */
 
   const registerHit = useCallback(() => {
     const currentBeat = beatClockRef.current.currentBeat;
-    // Allow hitting either the word that JUST exploded (within 0.6 beat grace)
-    // or the head word currently climbing into the hit zone.
-    const recent = lastJudgedRef.current;
     let target = null;
-    if (recent && !recent.hit && currentBeat - recent.hitBeat <= 0.65) {
-      target = recent;
-    } else if (queueRef.current[0] && !queueRef.current[0].hit) {
+
+    // Prefer an unhit word in the [hitBeat - 1, hitBeat + 1] window
+    for (const item of pendingMissChecksRef.current) {
+      if (!item.hit && currentBeat - item.hitBeat <= 1.15) {
+        target = item;
+        break;
+      }
+    }
+    if (!target && queueRef.current[0] && !queueRef.current[0].hit) {
       target = queueRef.current[0];
     }
+    if (!target) return;
 
-    if (!target || target.hit) return;
-    target.hit = true;
-
-    let judgement = TIMING.MISS;
-    let offsetMs = 0;
-
-    if (effectiveBpm) {
-      offsetMs = offsetFromNearestBeat(beatClockRef.current.audioTime, effectiveBpm);
-      judgement = judgeOffset(offsetMs);
-    }
-
-    let origin = { x: 0, y: 0 };
-    const anchorEl = targetBoxRef.current || frontCardRef.current;
-    if (anchorEl) {
-      const rect = anchorEl.getBoundingClientRect();
-      origin = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-    }
-
-    if (judgement === TIMING.PERFECT || judgement === TIMING.GOOD) {
-      setPop({
-        ...origin,
-        strength: judgement,
-        key: `${Date.now()}-${target.text}`,
-      });
-      setFlash(judgement);
-      onStageBurstRef.current?.();
-    } else {
-      setFlash('miss');
-    }
-
-    onWordHit?.(target.text, {
-      onBeat: judgement === TIMING.PERFECT,
-      offsetMs,
-      judgement,
-    });
-  }, [effectiveBpm, onWordHit]);
+    markWordAsHit(target, { heardText: target.text, viaSpeech: false });
+  }, [markWordAsHit]);
 
   useEffect(() => {
     if (!running) return undefined;
@@ -380,7 +469,7 @@ const WordGenerator = memo(function WordGenerator({
 
   return (
     <div className="relative z-10 w-full">
-      {/* Centered brand logo + 4-beat visual pulse bar */}
+      {/* Centered brand logo + 4-beat visual pulse bar + Rhyme Nest / Speech pill */}
       <div className="flex flex-col items-center pb-1 pt-2">
         <img
           ref={logoRef}
@@ -403,7 +492,51 @@ const WordGenerator = memo(function WordGenerator({
             />
           ))}
         </div>
+
+        {/* Rhyme nest & Live Vietnamese speech recognition status */}
+        {running ? (
+          <div className="mt-2 flex flex-wrap items-center justify-center gap-1.5">
+            {currentNest ? (
+              <span className="rounded-full border border-accent/45 bg-accent/12 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-lighter">
+                {t('stage.rhymeNest', { nest: currentNest })}
+              </span>
+            ) : null}
+
+            <span
+              className={`rounded-full border px-2.5 py-0.5 text-[10px] font-semibold ${
+                speechStatus === 'listening'
+                  ? 'border-success/50 bg-success/15 text-success'
+                  : 'border-line-strong bg-surface-raised/80 text-content-subtle'
+              }`}
+            >
+              {speechStatus === 'listening'
+                ? liveTranscript
+                  ? `🎙 “${liveTranscript}”`
+                  : `🎙 ${t('stage.speechListening')}`
+                : speechStatus === 'unsupported' || speechStatus === 'denied'
+                  ? `🔇 ${t('stage.speechUnavailable')}`
+                  : `🎙 ${t('stage.speechReady')}`}
+            </span>
+          </div>
+        ) : null}
       </div>
+
+      {/* Battle Turn Switch Warning Banner (1 bar before switching players) */}
+      <AnimatePresence>
+        {running && battleMode && turnBanner ? (
+          <motion.div
+            key={turnBanner}
+            initial={{ opacity: 0, y: -8, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -6, scale: 0.92 }}
+            transition={SPRING_BOUNCY}
+            className="mx-auto mb-1 flex w-fit items-center gap-1.5 rounded-full border border-secondary/70 bg-secondary/20 px-4 py-1 text-xs font-extrabold uppercase tracking-wider text-content shadow-lift backdrop-blur-md"
+          >
+            <span>⚡</span>
+            <span>{t('stage.nextTurn', { name: turnBanner })}</span>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
 
       {/* Vertical rhythm highway + 4-corner orange bracket hit zone */}
       <div className="stage-highway">
@@ -411,7 +544,10 @@ const WordGenerator = memo(function WordGenerator({
           ref={targetBoxRef}
           onClick={running ? registerHit : undefined}
           className={`stage-target-box ${bursts.length > 0 && running ? 'is-landing' : ''}`}
-          style={{ pointerEvents: running ? 'auto' : 'none', cursor: running ? 'pointer' : 'default' }}
+          style={{
+            pointerEvents: running ? 'auto' : 'none',
+            cursor: running ? 'pointer' : 'default',
+          }}
         >
           <span
             key={`sweep-${sweepKey}`}
@@ -423,12 +559,10 @@ const WordGenerator = memo(function WordGenerator({
           <span className="stage-bracket stage-bracket-bl" aria-hidden="true" />
           <span className="stage-bracket stage-bracket-br" aria-hidden="true" />
 
-          {/* 16-beat opening timeline (Beats 0..11: 3x 1-2-3-4; Beats 12..15: 3-2-1-GO!) */}
           {running && introBeat !== null ? (
             <IntroCountdownOverlay introBeat={introBeat} />
           ) : null}
 
-          {/* Explode-and-unmount word burst right inside the hit zone */}
           <TargetExplosion bursts={bursts} onDone={handleBurstDone} />
         </div>
 

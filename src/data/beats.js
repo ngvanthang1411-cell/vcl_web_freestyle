@@ -5,15 +5,9 @@
  * `npm run generate:beats` (see scripts/generate-beats.mjs) — free to use and
  * redistribute.
  *
- * `title` is the track name and stays the same in every language. `mood` is a
- * short description and is localised.
- *
- * TO SWAP IN YOUR OWN BEATS:
- *   1. Drop the audio file into /public/beats/ (e.g. /public/beats/my-beat.mp3).
- *   2. Add an entry below with the matching `src`, `title`, `bpm` and `duration`
- *      (duration in seconds — it is shown on the card and used for the progress bar).
- *   3. `src` must be a root-relative URL like '/beats/my-beat.mp3' so Vite serves
- *      it from /public.
+ * Each beat includes BPM, bar1Offset (Điểm vào bar 1, giây), totalBars
+ * (Số bar bản game), vibe (Tag phong cách), and producer (Người làm beat)
+ * matching the VCL Beat sheet schema.
  */
 
 export const BEATS = [
@@ -23,7 +17,10 @@ export const BEATS = [
     src: '/beats/neon-nightrun.wav',
     bpm: 92,
     duration: 20.87,
+    bar1Offset: 0,
+    totalBars: 32,
     vibe: 'Street',
+    producer: 'VCL Studio',
     colors: ['#F78501', '#753F01'],
     bars: [0.78, 0.28, 0.45, 0.96, 0.24, 0.56, 0.34, 0.22, 0.48, 1.0, 0.32, 0.4],
     mood: {
@@ -37,7 +34,10 @@ export const BEATS = [
     src: '/beats/concrete-bounce.wav',
     bpm: 104,
     duration: 18.46,
+    bar1Offset: 0,
+    totalBars: 32,
     vibe: 'Bounce',
+    producer: 'VCL Studio',
     colors: ['#FF4D9D', '#7A0C3E'],
     bars: [0.92, 0.32, 0.64, 0.82, 0.2, 0.72, 0.44, 0.26, 0.88, 0.68, 0.3, 0.52],
     mood: {
@@ -51,7 +51,10 @@ export const BEATS = [
     src: '/beats/after-hours.wav',
     bpm: 78,
     duration: 24.62,
+    bar1Offset: 0,
+    totalBars: 32,
     vibe: 'Chill',
+    producer: 'VCL Studio',
     colors: ['#BE70FA', '#481475'],
     bars: [0.46, 0.22, 0.74, 0.54, 0.18, 0.62, 0.3, 0.24, 0.92, 0.48, 0.26, 0.36],
     mood: {
@@ -65,7 +68,10 @@ export const BEATS = [
     src: '/beats/chrome-crest.wav',
     bpm: 126,
     duration: 15.24,
+    bar1Offset: 0,
+    totalBars: 32,
     vibe: 'Uptempo',
+    producer: 'VCL Studio',
     colors: ['#34D399', '#0E5840'],
     bars: [1.0, 0.36, 0.52, 0.88, 0.26, 0.42, 0.66, 0.22, 0.5, 0.98, 0.38, 0.46],
     mood: {
@@ -79,7 +85,10 @@ export const BEATS = [
     src: '/beats/rooftop-radio.wav',
     bpm: 98,
     duration: 19.59,
+    bar1Offset: 0,
+    totalBars: 32,
     vibe: 'Bounce',
+    producer: 'VCL Studio',
     colors: ['#FBBF24', '#7C4B05'],
     bars: [0.84, 0.44, 0.72, 0.6, 0.22, 0.86, 0.42, 0.28, 0.76, 0.94, 0.36, 0.58],
     mood: {
@@ -93,7 +102,10 @@ export const BEATS = [
     src: '/beats/midnight-lane.wav',
     bpm: 86,
     duration: 22.33,
+    bar1Offset: 0,
+    totalBars: 32,
     vibe: 'Dark',
+    producer: 'VCL Studio',
     colors: ['#22D3EE', '#0D4E63'],
     bars: [0.68, 0.24, 0.38, 0.98, 0.2, 0.46, 0.78, 0.18, 0.34, 0.9, 0.28, 0.42],
     mood: {
@@ -103,10 +115,10 @@ export const BEATS = [
   },
 ];
 
-export const BEAT_VIBES = ['All', 'Street', 'Bounce', 'Chill', 'Uptempo', 'Dark'];
+export const BEAT_VIBES = ['All', 'Custom', 'Street', 'Bounce', 'Chill', 'Uptempo', 'Dark'];
 
-export function getBeatById(id) {
-  return BEATS.find((b) => b.id === id) ?? null;
+export function getBeatById(id, extraBeats = []) {
+  return [...extraBeats, ...BEATS].find((b) => b.id === id) ?? null;
 }
 
 /** Reads a localised beat field, falling back to English. */

@@ -7,14 +7,16 @@ import { useT } from '../i18n/LanguageContext';
  * The application shell.
  *
  * Mobile-first vertical app column with a crisp topbar (live status pill /
- * brand mark, language switcher, and local stats trophy button), main content,
- * optional sticky bottom dock, and minimal footer.
+ * brand mark, Demo Auth account button, language switcher, and leaderboard trophy
+ * button), main content, optional sticky bottom dock, and minimal footer.
  */
 export default function AppShell({
   onNavigate,
   beatCount,
   screen = 'landing',
   runCount = 0,
+  user = null,
+  onOpenAuth = null,
   footer = null,
   children,
 }) {
@@ -24,7 +26,7 @@ export default function AppShell({
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-[560px] flex-col px-4 pb-8 pt-4 sm:px-5 sm:pt-6">
       {/* ------------------------------------------------------ top bar */}
-      <header className="flex items-center justify-between gap-2.5">
+      <header className="flex items-center justify-between gap-2">
         {isHome ? (
           <button
             type="button"
@@ -53,8 +55,30 @@ export default function AppShell({
           </button>
         )}
 
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+          {onOpenAuth ? (
+            <motion.button
+              type="button"
+              whileHover={{ y: -1, scale: 1.03 }}
+              whileTap={{ scale: 0.95 }}
+              transition={SPRING_SNAPPY}
+              onClick={onOpenAuth}
+              className={`inline-flex h-9 max-w-[8.5rem] items-center gap-1.5 rounded-full border px-2.5 text-xs font-semibold transition-colors ${
+                user
+                  ? 'border-accent/60 bg-accent/15 text-accent-lighter'
+                  : 'border-line bg-surface-raised/85 text-content-muted hover:border-accent/50 hover:text-content'
+              }`}
+              title={user ? `${user.displayName} (@${user.socialHandle})` : t('auth.loginBtn')}
+            >
+              <span aria-hidden="true">{user ? user.rankIcon || '🎤' : '👤'}</span>
+              <span className="truncate">
+                {user ? `@${user.socialHandle}` : t('auth.shortLogin')}
+              </span>
+            </motion.button>
+          ) : null}
+
           <LanguageSwitcher />
+
           <motion.button
             type="button"
             whileHover={{ y: -1, scale: 1.07 }}
