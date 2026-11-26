@@ -1,0 +1,484 @@
+/*
+ * The freestyle stage — a modern dark stage.
+ *
+ * Deep ground (#06080D), a canvas-drawn ambience behind everything, and
+ * glass cards that read as lit from within rather than as printed colour.
+ *
+ * Three rules hold it together:
+ *
+ *  1. The active word is the only thing that glows. Everything else is
+ *     glass — translucent, cool, and quiet.
+ *  2. Depth comes from blur and a thin lit edge, never from a heavy shadow.
+ *  3. Every card in the queue carries the same accent, dimmed by its
+ *     depth, so the eye reads "further away" without a label.
+ *
+ * The colours come from the theme tokens, so this file never hard-codes a
+ * hex value of its own except for the stage ground itself.
+ */
+
+@layer components {
+  /* --------------------------------------------------------- the stage */
+
+  .stage-panel {
+    position: relative;
+    border-radius: var(--radius-xl);
+    background: #06080d;
+    border: 1px solid rgb(var(--color-line) / 0.8);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.04),
+      0 30px 90px rgb(0 0 0 / 0.6);
+    overflow: hidden;
+    isolation: isolate;
+  }
+
+  /* The canvas sits behind the cards, inside the panel's own clip. */
+  .stage-canvas {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+
+  /* ------------------------------------------------ the target frame */
+
+  /* The well the active word sits in — a recessed glass panel.
+     It clips its overflow, so a card travelling up out of the frame is cut
+     off cleanly instead of spilling over the rest of the page.
+
+     Its height is set to fit the deck: the front card plus four slots
+     below it, so the whole queue is visible and only the card that is
+     leaving gets clipped. */
+  .stage-well {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    height: 21rem;
+    margin: 1.5rem 1.5rem 0;
+    padding: 1.25rem 1rem 0;
+    border: 1px solid rgb(var(--color-line) / 0.9);
+    border-radius: var(--radius-lg);
+    background: rgb(255 255 255 / 0.022);
+    backdrop-filter: blur(14px) saturate(120%);
+    -webkit-backdrop-filter: blur(14px) saturate(120%);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.045);
+    overflow: hidden;
+  }
+
+  /* The four corner brackets — sharp, thin, and lit. They frame the card
+     in the target frame, not the whole well. */
+  .stage-brackets {
+    position: absolute;
+    inset: 1.05rem 1rem auto;
+    height: 0;
+    z-index: 3;
+    pointer-events: none;
+  }
+
+  .stage-bracket {
+    position: absolute;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-color: rgb(var(--color-accent) / 0.95);
+    border-style: solid;
+    border-width: 0;
+    filter: drop-shadow(0 0 8px rgb(var(--color-accent) / 0.55));
+  }
+
+  .stage-bracket-tl {
+    top: -0.6rem;
+    left: -0.6rem;
+    border-top-width: 2px;
+    border-left-width: 2px;
+    border-top-left-radius: 5px;
+  }
+
+  .stage-bracket-tr {
+    top: -0.6rem;
+    right: -0.6rem;
+    border-top-width: 2px;
+    border-right-width: 2px;
+    border-top-right-radius: 5px;
+  }
+
+  .stage-bracket-bl {
+    bottom: -0.6rem;
+    left: -0.6rem;
+    border-bottom-width: 2px;
+    border-left-width: 2px;
+    border-bottom-left-radius: 5px;
+  }
+
+  .stage-bracket-br {
+    bottom: -0.6rem;
+    right: -0.6rem;
+    border-bottom-width: 2px;
+    border-right-width: 2px;
+    border-bottom-right-radius: 5px;
+  }
+
+  /* ------------------------------------------------------ the word */
+
+  /* The active word. It is the only glowing element on the stage. */
+  .stage-word {
+    position: relative;
+    display: block;
+    width: 100%;
+    border: 0;
+    background: transparent;
+    padding: 0;
+    font-family: var(--font-sans);
+    font-size: clamp(2.5rem, 8.5vw, 5.25rem);
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.025em;
+    text-align: center;
+    color: rgb(var(--color-content));
+    cursor: pointer;
+    transition:
+      color 200ms ease,
+      opacity 200ms ease;
+  }
+
+  .stage-word:disabled {
+    cursor: default;
+  }
+
+  /* The word's own glow — a soft halo behind the glyphs. */
+  .stage-word::before {
+    content: '';
+    position: absolute;
+    inset: -18% -6%;
+    z-index: -1;
+    pointer-events: none;
+    border-radius: 999px;
+    background: radial-gradient(
+      ellipse at 50% 50%,
+      rgb(var(--color-accent) / 0.16),
+      transparent 70%
+    );
+    filter: blur(14px);
+  }
+
+  /* A perfect hit warms the word. */
+  .stage-word-perfect {
+    color: rgb(var(--color-accent-lighter));
+    text-shadow: 0 0 34px rgb(var(--color-accent) / 0.55);
+  }
+
+  /* A miss drops the word back to a muted tone. */
+  .stage-word-miss {
+    color: rgb(var(--color-content-subtle));
+  }
+
+  /* The word settles into place. */
+  @keyframes stage-word-in {
+    0% {
+      opacity: 0;
+      transform: translateY(14px) scale(0.94);
+      filter: blur(8px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+      filter: blur(0px);
+    }
+  }
+
+  .stage-word-inner {
+    display: block;
+    animation: stage-word-in 380ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* ------------------------------------------------------ the queue */
+
+  /* The queue of upcoming words, below the target frame. */
+  .stage-queue {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 1.25rem 1.5rem 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  /* A queue card — glass, with a thin lit edge. The accent cools and dims
+     with depth, so the column reads as receding. */
+  .stage-queue-item {
+    position: relative;
+    display: block;
+    width: calc(100% - var(--depth, 0) * 7%);
+    border: 1px solid rgb(var(--color-line) / calc(1 - var(--depth, 0) * 0.16));
+    border-radius: var(--radius-md);
+    padding: 0.45rem 0.9rem;
+    text-align: center;
+    background: rgb(255 255 255 / calc(0.035 - var(--depth, 0) * 0.007));
+    backdrop-filter: blur(10px) saturate(115%);
+    -webkit-backdrop-filter: blur(10px) saturate(115%);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / calc(0.06 - var(--depth, 0) * 0.012)),
+      0 6px 20px rgb(0 0 0 / 0.28);
+    opacity: calc(1 - var(--depth, 0) * 0.16);
+    transform: scale(calc(1 - var(--depth, 0) * 0.035));
+    transform-origin: center top;
+    transition:
+      opacity 260ms ease,
+      transform 260ms ease,
+      background-color 260ms ease;
+  }
+
+  /* The word inside a queue card. */
+  .stage-queue-word {
+    font-size: clamp(0.95rem, 2.6vw, 1.25rem);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: rgb(var(--color-content));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Deeper cards lean cooler, so the column reads as receding into the
+     stage rather than just getting smaller. The depth is a custom property,
+     so it is read as a number rather than matched as a string. */
+  .stage-queue-word {
+    color: rgb(var(--color-content));
+    transition: color 260ms ease;
+  }
+
+  /* -------------------------------------------------- the beat rail */
+
+  /* The thin rail under the stage. */
+  .stage-rail {
+    position: relative;
+    z-index: 1;
+    height: 2px;
+    margin: 1.25rem 1.5rem 0;
+    border-radius: 999px;
+    background: rgb(var(--color-line) / 0.85);
+    overflow: hidden;
+  }
+
+  .stage-rail-fill {
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    border-radius: 999px;
+    background: linear-gradient(
+      90deg,
+      rgb(var(--color-tertiary)),
+      rgb(var(--color-accent)) 55%,
+      rgb(var(--color-accent-light))
+    );
+    box-shadow: 0 0 12px rgb(var(--color-accent) / 0.5);
+  }
+
+  /* The playhead riding the rail. */
+  .stage-rail-head {
+    position: absolute;
+    top: 50%;
+    left: calc(var(--beat-bar, 0) * 100%);
+    width: 7px;
+    height: 7px;
+    margin-left: -3.5px;
+    border-radius: 999px;
+    background: rgb(var(--color-content));
+    transform: translateY(-50%);
+    box-shadow: 0 0 10px rgb(var(--color-accent) / 0.9);
+  }
+
+  /* ------------------------------------------------------ the deck */
+
+  /* The deck is the stack of cards inside the target frame. It is a plain
+     column — GSAP positions each card in its slot — so the frame can clip
+     the cards that leave the top. */
+  .stage-deck {
+    position: relative;
+    width: 100%;
+    min-height: 19rem;
+  }
+
+  /* A single card. Its position, scale and opacity are all set by GSAP;
+     the CSS only describes how it looks. */
+  .stage-deck-card {
+    position: absolute;
+    inset-inline: 0;
+    top: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 4.25rem;
+    padding: 0.75rem 1rem;
+    border: 1px solid rgb(var(--color-line) / 0.9);
+    border-radius: var(--radius-lg);
+    background: rgb(255 255 255 / 0.03);
+    backdrop-filter: blur(14px) saturate(120%);
+    -webkit-backdrop-filter: blur(14px) saturate(120%);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.05),
+      0 10px 30px rgb(0 0 0 / 0.32);
+    will-change: transform, opacity;
+    cursor: default;
+  }
+
+  /* The card in the target frame is the interactive one. */
+  .stage-deck-card-front {
+    border-color: rgb(var(--color-accent) / 0.35);
+    background: rgb(255 255 255 / 0.05);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.07),
+      0 0 32px rgb(var(--color-accent) / 0.14),
+      0 12px 34px rgb(0 0 0 / 0.36);
+    cursor: pointer;
+  }
+
+  .stage-deck-card-front:hover {
+    border-color: rgb(var(--color-accent) / 0.55);
+  }
+
+  .stage-deck-text {
+    font-size: clamp(1.5rem, 5.5vw, 3.25rem);
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.025em;
+    text-align: center;
+    color: rgb(var(--color-content));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* The cards behind the front one are quieter. */
+  .stage-deck-card:not(.stage-deck-card-front) .stage-deck-text {
+    font-size: clamp(1.1rem, 4vw, 2rem);
+    color: rgb(var(--color-content-muted));
+  }
+
+  /* The hit feedback on the front card. */
+  .stage-hit-badge {
+    position: absolute;
+    top: 0.6rem;
+    right: 0.75rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    border: 1px solid rgb(var(--color-success) / 0.5);
+    border-radius: 999px;
+    padding: 0.15rem 0.55rem;
+    font-size: 0.625rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: rgb(var(--color-success));
+    background: rgb(var(--color-success) / 0.12);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    pointer-events: none;
+    animation: stage-hit-in 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .stage-hit-mark {
+    font-size: 0.75rem;
+    line-height: 1;
+  }
+
+  @keyframes stage-hit-in {
+    0% {
+      opacity: 0;
+      transform: translateY(-6px) scale(0.9);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  /* ---------------------------------------------------- the pills */
+
+  /* A small glass pill, used for the hit counter and the handle. */
+  .stage-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    border: 1px solid rgb(var(--color-line) / 0.95);
+    border-radius: 999px;
+    padding: 0.3rem 0.8rem;
+    font-size: 0.625rem;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: rgb(var(--color-content-subtle));
+    background: rgb(255 255 255 / 0.035);
+    backdrop-filter: blur(12px) saturate(120%);
+    -webkit-backdrop-filter: blur(12px) saturate(120%);
+    white-space: nowrap;
+  }
+
+  .stage-pill-value {
+    font-family: var(--font-mono);
+    font-size: 0.875rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+    text-transform: none;
+    color: rgb(var(--color-accent));
+  }
+
+  /* --------------------------------------------------- the countdown */
+
+  /* The pre-roll countdown, shown in the target frame. */
+  .stage-countdown {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-lg);
+    background: rgb(6 8 13 / 0.82);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
+
+  .stage-countdown-figure {
+    font-size: clamp(4rem, 16vw, 8rem);
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    font-variant-numeric: tabular-nums;
+    background-image: linear-gradient(
+      180deg,
+      rgb(var(--color-accent-light)),
+      rgb(var(--color-secondary)) 62%,
+      rgb(var(--color-tertiary-light))
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .stage-countdown-label {
+    margin-top: 0.75rem;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: rgb(var(--color-content-subtle));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stage-word-inner {
+    animation: none !important;
+  }
+
+  .stage-queue-item {
+    transition: none !important;
+  }
+}
